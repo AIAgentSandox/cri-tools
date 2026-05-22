@@ -207,8 +207,15 @@ verify-go-modules: ## Verify vendored golang modules.
 
 # Containerd git ref built into the local containerized test image. Mirrors
 # CI's primary matrix entry (main). NRI is only configured/tested for main,
-# matching .github/workflows/containerd.yml.
+# matching .github/workflows/containerd.yml. Override to test other refs, e.g.
+# make test-critest-containerd CONTAINERD_VERSION=release/1.7
 CONTAINERD_VERSION ?= main
+
+# runc flavor built into the image (runc or crun) and the containerd runtime
+# handler used by the generated config. Defaults mirror CI's primary matrix
+# entry. Override via, e.g. RUNC_FLAVOR=crun.
+RUNC_FLAVOR ?= runc
+RUNTIME ?= io.containerd.runc.v2
 
 # Pass --nri-socket to critest only when NRI is enabled (containerd main),
 # mirroring .github/workflows/containerd.yml which adds the flag only for main.
@@ -234,9 +241,11 @@ test-e2e: $(GINKGO) ## Run the e2e test suite.
 		$(TESTFLAGS)
 
 .PHONY: test-critest-containerd
-test-critest-containerd: ## Run the critest in a container with containerd.
+test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+	RUNC_FLAVOR=$(RUNC_FLAVOR) \
+	RUNTIME=$(RUNTIME) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
 		--runtime-endpoint=unix:///run/containerd/containerd.sock \
 		$(NRI_FLAGS) \
@@ -246,8 +255,11 @@ test-critest-containerd: ## Run the critest in a container with containerd.
 		$(TESTFLAGS)
 
 .PHONY: test-crictl-e2e-containerd
-test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd.
+test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
+	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
+	RUNC_FLAVOR=$(RUNC_FLAVOR) \
+	RUNTIME=$(RUNTIME) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/crictl-e2e \
 		-crictl-binary-path=/usr/local/bin/critest-tools/crictl \
 		-crictl-runtime-endpoint=unix:///run/containerd/containerd.sock \

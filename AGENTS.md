@@ -145,6 +145,28 @@ Or for `crictl` e2e:
 make test-crictl-e2e-containerd TESTFLAGS='--ginkgo.focus="pull"'
 ```
 
+##### Selecting the containerd version
+
+By default the image builds containerd from source at the `main` git ref,
+matching CI's primary matrix entry (NRI enabled, `--parallel=8`). Pass
+`CONTAINERD_VERSION` to test another ref, and `RUNC_FLAVOR` / `RUNTIME` to
+change the runtime:
+
+```bash
+make test-critest-containerd CONTAINERD_VERSION=release/1.7
+make test-critest-containerd CONTAINERD_VERSION=main RUNC_FLAVOR=crun
+```
+
+The built image is tagged per version (`containerd-local-test:<version>`) and
+each version gets its own data volume, so images are cached and reused across
+runs — only a changed `CONTAINERD_VERSION`/`RUNC_FLAVOR` triggers a rebuild
+(set `FORCE_REBUILD=1` to force one). To delete the cached images and volumes
+so they are regenerated:
+
+```bash
+make clean-critest-containerd-images
+```
+
 #### Running Tests Serially
 
 Some tests are sensitive to parallel execution and may fail due to race conditions. To avoid these issues, you can run the tests serially by adding the `Serial` decorator to the test case in the source code.

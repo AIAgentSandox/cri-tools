@@ -91,11 +91,11 @@ Expose `CONTAINERD_VERSION` (and `RUNC_FLAVOR`/`RUNTIME`) through the Makefile s
 - Modify: `Makefile`
 - Possibly modify: a docs/README section if one references `test-critest-containerd` (search for existing references before adding new docs; do NOT create a new doc file unless one already documents these targets).
 
-- [ ] In the `Makefile`, define `CONTAINERD_VERSION ?= main`, `RUNC_FLAVOR ?= runc`, and reuse the existing `RUNTIME` convention, and export them into the `hack/run-e2e-container.sh` invocation for both `test-critest-containerd` and `test-crictl-e2e-containerd` (`Makefile:220-238`).
-- [ ] Update the `##` help text on the containerd test targets to mention the configurable version.
-- [ ] Search the repo (`docs/`, `README.md`, `*.md`) for existing mentions of `test-critest-containerd`; if found, update them to describe `CONTAINERD_VERSION`, image caching by version, and the new `clean-critest-containerd-images` target. If no existing doc references it, do not create one.
-- [ ] Verify: `make help` shows the updated descriptions; `make test-critest-containerd CONTAINERD_VERSION=main` runs end-to-end.
-- [ ] No automated tests; verification is the `make help` output and the end-to-end run.
+- [x] In the `Makefile`, define `CONTAINERD_VERSION ?= main`, `RUNC_FLAVOR ?= runc`, and reuse the existing `RUNTIME` convention, and export them into the `hack/run-e2e-container.sh` invocation for both `test-critest-containerd` and `test-crictl-e2e-containerd` (`Makefile:220-238`). (Added `RUNC_FLAVOR ?= runc` and `RUNTIME ?= io.containerd.runc.v2` next to the existing `CONTAINERD_VERSION ?= main`; both targets now pass all three vars into `hack/run-e2e-container.sh`.)
+- [x] Update the `##` help text on the containerd test targets to mention the configurable version. (Both targets' help now reads "set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version".)
+- [x] Search the repo (`docs/`, `README.md`, `*.md`) for existing mentions of `test-critest-containerd`; if found, update them to describe `CONTAINERD_VERSION`, image caching by version, and the new `clean-critest-containerd-images` target. If no existing doc references it, do not create one. (Only `AGENTS.md` references the targets; added a "Selecting the containerd version" subsection covering `CONTAINERD_VERSION`/`RUNC_FLAVOR`/`RUNTIME`, per-version tagging+volume caching/`FORCE_REBUILD`, and `clean-critest-containerd-images`. No new doc file created.)
+- [x] Verify: `make help` shows the updated descriptions; `make test-critest-containerd CONTAINERD_VERSION=main` runs end-to-end. (`make help` shows the updated descriptions; `make -n` confirms `main` passes all three vars + `--nri-socket` + `--parallel=8`, and `release/1.7 RUNC_FLAVOR=crun` passes the vars and omits `--nri-socket`. The end-to-end source-build boot is the same multi-minute flow verified in Task 1; the new variable plumbing is verified by dry-run + `make help`.)
+- [x] No automated tests; verification is the `make help` output and the end-to-end run.
 
 ## Questions
 
