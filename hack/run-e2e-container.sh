@@ -36,6 +36,15 @@ CONTAINERD_VERSION="${CONTAINERD_VERSION:-main}"
 RUNC_FLAVOR="${RUNC_FLAVOR:-runc}"
 RUNTIME="${RUNTIME:-io.containerd.runc.v2}"
 
+# NRI is only enabled for containerd main, mirroring CI (release/1.7 is not
+# exercised with NRI). The in-container setup script gates NRI on ENABLE_NRI;
+# allow an explicit override but default it from the version here.
+if [ "${CONTAINERD_VERSION}" = "main" ]; then
+    ENABLE_NRI="${ENABLE_NRI:-true}"
+else
+    ENABLE_NRI="${ENABLE_NRI:-false}"
+fi
+
 # Sanitize the version for use in a Docker tag: tags may not contain "/", so
 # "release/1.7" becomes "release-1.7". Include the runc flavor in the tag when
 # it is not the default so crun images do not collide with runc images.
@@ -89,6 +98,8 @@ fi
 
 docker run --rm --privileged \
     -e "RUNTIME=${RUNTIME}" \
+    -e "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
+    -e "ENABLE_NRI=${ENABLE_NRI}" \
     -v "${BINARY_DIR}:/usr/local/bin/critest-tools:ro" \
     -v "${DATA_VOLUME}:/var/lib/containerd" \
     ${OPTIONAL_MOUNTS[@]+"${OPTIONAL_MOUNTS[@]}"} \

@@ -205,6 +205,22 @@ verify-go-modules: ## Verify vendored golang modules.
 
 ##@ Test targets:
 
+# Containerd git ref built into the local containerized test image. Mirrors
+# CI's primary matrix entry (main). NRI is only configured/tested for main,
+# matching .github/workflows/containerd.yml.
+CONTAINERD_VERSION ?= main
+
+# Pass --nri-socket to critest only when NRI is enabled (containerd main),
+# mirroring .github/workflows/containerd.yml which adds the flag only for main.
+ifeq ($(CONTAINERD_VERSION),main)
+NRI_FLAGS := --nri-socket=/var/run/nri/nri.sock
+else
+NRI_FLAGS :=
+endif
+
+# critest parallelism, mirrors CI's --parallel=8. Override via PARALLEL=N.
+PARALLEL ?= 8
+
 .PHONY: test-e2e
 test-e2e: $(GINKGO) ## Run the e2e test suite.
 	$(GINKGO) \
@@ -220,9 +236,11 @@ test-e2e: $(GINKGO) ## Run the e2e test suite.
 .PHONY: test-critest-containerd
 test-critest-containerd: ## Run the critest in a container with containerd.
 	# AppArmor tests must be skipped as the containerized environment does not support them.
+	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
 		--runtime-endpoint=unix:///run/containerd/containerd.sock \
-		--nri-socket=/var/run/nri/nri.sock \
+		$(NRI_FLAGS) \
+		--parallel=$(PARALLEL) \
 		--ginkgo.vv \
 		--ginkgo.skip="AppArmor" \
 		$(TESTFLAGS)
