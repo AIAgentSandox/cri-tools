@@ -217,9 +217,13 @@ CONTAINERD_VERSION ?= main
 RUNC_FLAVOR ?= runc
 RUNTIME ?= io.containerd.runc.v2
 
-# Pass --nri-socket to critest only when NRI is enabled (containerd main),
-# mirroring .github/workflows/containerd.yml which adds the flag only for main.
-ifeq ($(CONTAINERD_VERSION),main)
+# NRI defaults on for containerd main and off otherwise, mirroring
+# .github/workflows/containerd.yml (release/1.7 is not exercised with NRI).
+# ENABLE_NRI is the single source of truth: it gates both the in-container NRI
+# setup (passed through to hack/run-e2e-container.sh) and critest's
+# --nri-socket flag, so the two never disagree even when overridden.
+ENABLE_NRI ?= $(if $(filter main,$(CONTAINERD_VERSION)),true,false)
+ifeq ($(ENABLE_NRI),true)
 NRI_FLAGS := --nri-socket=/var/run/nri/nri.sock
 else
 NRI_FLAGS :=
@@ -246,6 +250,7 @@ test-critest-containerd: ## Run the critest in a container with containerd (set 
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	RUNC_FLAVOR=$(RUNC_FLAVOR) \
 	RUNTIME=$(RUNTIME) \
+	ENABLE_NRI=$(ENABLE_NRI) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
 		--runtime-endpoint=unix:///run/containerd/containerd.sock \
 		$(NRI_FLAGS) \
