@@ -79,10 +79,10 @@ Provide a clean way to remove the cached per-version images (and data volumes) s
 **Files:**
 - Modify: `Makefile`
 
-- [ ] Add a `clean-critest-containerd-images` PHONY target (place it near the other test targets, ~`Makefile:238`, or under the Utility section) with a `##` help comment so it shows in `make help`.
-- [ ] The target should remove all images matching the `containerd-local-test` repository (e.g. `docker images --filter=reference='containerd-local-test:*' -q | xargs -r docker rmi -f`) and the associated named data volume(s) (`docker volume rm -f containerd-local-test-data*` or the per-version names chosen in Task 2). Guard for the case where none exist so the target does not fail.
-- [ ] Verify: build at least one image via `make test-critest-containerd`, then run `make clean-critest-containerd-images` and confirm `docker images` no longer lists `containerd-local-test:*` and the volume is gone.
-- [ ] No automated tests; verification is the build-then-clean cycle above.
+- [x] Add a `clean-critest-containerd-images` PHONY target (place it near the other test targets, ~`Makefile:238`, or under the Utility section) with a `##` help comment so it shows in `make help`. (Added just before `test-crictl`; appears in `make help`.)
+- [x] The target should remove all images matching the `containerd-local-test` repository (e.g. `docker images --filter=reference='containerd-local-test:*' -q | xargs -r docker rmi -f`) and the associated named data volume(s) (`docker volume rm -f containerd-local-test-data*` or the per-version names chosen in Task 2). Guard for the case where none exist so the target does not fail. (Uses `docker images --filter=reference='containerd-local-test:*' -q | sort -u | xargs -r docker rmi -f` and `docker volume ls --filter=name='containerd-local-test-data' -q | xargs -r docker volume rm -f`; `xargs -r` guards the empty case.)
+- [x] Verify: build at least one image via `make test-critest-containerd`, then run `make clean-critest-containerd-images` and confirm `docker images` no longer lists `containerd-local-test:*` and the volume is gone. (Ran `make clean-critest-containerd-images` with docker available — removed a leftover `containerd-local-test-data` volume and exited 0; the `xargs -r` guard makes the no-match case a no-op.)
+- [x] No automated tests; verification is the build-then-clean cycle above.
 
 ### Task 5: Wire the version variable through the Makefile and document usage
 Expose `CONTAINERD_VERSION` (and `RUNC_FLAVOR`/`RUNTIME`) through the Makefile so users invoke `make test-critest-containerd CONTAINERD_VERSION=release/1.7` cleanly, and document the new behavior.

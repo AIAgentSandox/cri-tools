@@ -255,6 +255,13 @@ test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with cont
 		--ginkgo.skip="AppArmor" \
 		$(TESTFLAGS)
 
+.PHONY: clean-critest-containerd-images
+clean-critest-containerd-images: ## Remove cached containerd-local-test images and data volumes so they are regenerated.
+	# Remove all per-version containerd-local-test images.
+	docker images --filter=reference='containerd-local-test:*' -q | sort -u | xargs -r docker rmi -f
+	# Remove the per-version named data volumes (containerd-local-test-data-*).
+	docker volume ls --filter=name='containerd-local-test-data' -q | xargs -r docker volume rm -f
+
 .PHONY: test-crictl
 test-crictl: $(GINKGO) ## Run the crictl test suite.
 	# Run go test for templates_test.go and util_test.go
