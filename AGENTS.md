@@ -164,8 +164,10 @@ The built image is tagged per version (`containerd-local-test:<version>`, with
 `-<flavor>` appended for a non-default `RUNC_FLAVOR`, e.g.
 `containerd-local-test:main-crun`) and each version gets its own data volume,
 so images are cached and reused across runs — only a changed
-`CONTAINERD_VERSION`/`RUNC_FLAVOR` triggers a rebuild (set `FORCE_REBUILD=1` to
-force one). To delete the cached images and volumes so they are regenerated:
+`CONTAINERD_VERSION`/`RUNC_FLAVOR` triggers a rebuild. Set `FORCE_REBUILD=1` to
+force a fresh build that bypasses the Docker layer cache (`--no-cache --pull`),
+which is needed to refetch a moving ref such as `main`. To delete the cached
+images and volumes so they are regenerated:
 
 ```bash
 make clean-critest-containerd-images

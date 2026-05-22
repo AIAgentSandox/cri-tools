@@ -68,8 +68,19 @@ DATA_VOLUME="containerd-local-test-data-${IMAGE_TAG}"
 if [ -z "${FORCE_REBUILD:-}" ] && docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
     echo "Reusing cached image ${IMAGE_NAME} (set FORCE_REBUILD=1 to rebuild)..."
 else
+    # The Dockerfile clones containerd and checks out CONTAINERD_VERSION in
+    # cached layers, so for a moving ref (e.g. main) a plain rebuild would reuse
+    # the previously fetched commit. FORCE_REBUILD must therefore bypass the
+    # layer cache (--no-cache) and refresh the base images (--pull) so the image
+    # is rebuilt against the current ref, matching CI which always checks out
+    # fresh.
+    BUILD_FLAGS=()
+    if [ -n "${FORCE_REBUILD:-}" ]; then
+        BUILD_FLAGS+=(--no-cache --pull)
+    fi
     echo "Building the containerd local test image ${IMAGE_NAME}..."
     docker build \
+        "${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}" \
         --build-arg "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
         --build-arg "RUNC_FLAVOR=${RUNC_FLAVOR}" \
         -t "${IMAGE_NAME}" \
