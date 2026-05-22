@@ -18,8 +18,9 @@
 # runtime engine and CNI plugins via containerd's own setup scripts. See
 # .github/workflows/containerd.yml.
 
-# Go toolchain version, kept in sync with this repo's go.mod.
-ARG GO_VERSION=1.26
+# Go toolchain version, extracted from go.mod by hack/run-e2e-container.sh
+# (mirroring CI's go-version-file approach). The default is a fallback only.
+ARG GO_VERSION=1.26.3
 
 FROM golang:${GO_VERSION} AS containerd-builder
 

@@ -24,7 +24,7 @@ cd "${REPO_ROOT}"
 # We assume the user has Go installed and can build for linux.
 # If they are on another OS, they need to set GOOS=linux.
 export GOOS=linux
-make binaries crictl-e2e
+make binaries crictl-e2e install.ginkgo
 
 # Determine architecture for mounting the right binary directory
 ARCH=$(go env GOARCH)
@@ -78,9 +78,13 @@ else
     if [ -n "${FORCE_REBUILD:-}" ]; then
         BUILD_FLAGS+=(--no-cache --pull)
     fi
+    # Extract Go version from go.mod, mirroring CI's go-version-file approach.
+    GO_VERSION="$(grep '^go ' go.mod | awk '{print $2}')"
+
     echo "Building the containerd local test image ${IMAGE_NAME}..."
     docker build \
         "${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}" \
+        --build-arg "GO_VERSION=${GO_VERSION}" \
         --build-arg "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
         --build-arg "RUNC_FLAVOR=${RUNC_FLAVOR}" \
         -t "${IMAGE_NAME}" \
@@ -90,6 +94,12 @@ fi
 # If no command is provided, default to critest
 if [ $# -eq 0 ]; then
     set -- /usr/local/bin/critest-tools/critest --runtime-endpoint=unix:///run/containerd/containerd.sock
+fi
+
+# When NRI is enabled, inject --nri-socket into critest arguments so the
+# container-side NRI setup and the critest flag always agree.
+if [ "${ENABLE_NRI}" = "true" ]; then
+    set -- "$@" --nri-socket=/var/run/nri/nri.sock
 fi
 
 # Run the e2e tests in the container
