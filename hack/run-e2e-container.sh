@@ -30,12 +30,41 @@ make binaries crictl-e2e
 ARCH=$(go env GOARCH)
 BINARY_DIR="${REPO_ROOT}/build/bin/linux/${ARCH}"
 
-# Image name
-IMAGE_NAME="containerd-local-test:latest"
+# Containerd version (git ref) to build into the image, the runc flavor, and the
+# runtime handler. Defaults mirror CI's primary matrix entry (main + runc).
+CONTAINERD_VERSION="${CONTAINERD_VERSION:-main}"
+RUNC_FLAVOR="${RUNC_FLAVOR:-runc}"
+RUNTIME="${RUNTIME:-io.containerd.runc.v2}"
 
-# Build the runner image
-echo "Building the containerd local test image..."
-docker build -t "${IMAGE_NAME}" -f images/containerd-local-test/Dockerfile .
+# Sanitize the version for use in a Docker tag: tags may not contain "/", so
+# "release/1.7" becomes "release-1.7". Include the runc flavor in the tag when
+# it is not the default so crun images do not collide with runc images.
+SANITIZED_VERSION="${CONTAINERD_VERSION//\//-}"
+IMAGE_TAG="${SANITIZED_VERSION}"
+if [ "${RUNC_FLAVOR}" != "runc" ]; then
+    IMAGE_TAG="${IMAGE_TAG}-${RUNC_FLAVOR}"
+fi
+IMAGE_NAME="containerd-local-test:${IMAGE_TAG}"
+
+# Namespace the data volume per containerd version: different containerd
+# versions can use incompatible content/metadata stores, so sharing one volume
+# across versions risks corruption. The clean target removes all of them.
+DATA_VOLUME="containerd-local-test-data-${IMAGE_TAG}"
+
+# Build the runner image, tagged per containerd version so it is cached and
+# reused on subsequent runs. Skip the build when the tagged image already
+# exists locally unless FORCE_REBUILD is set; Docker's layer cache handles the
+# version-change case when a new tag is requested.
+if [ -z "${FORCE_REBUILD:-}" ] && docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
+    echo "Reusing cached image ${IMAGE_NAME} (set FORCE_REBUILD=1 to rebuild)..."
+else
+    echo "Building the containerd local test image ${IMAGE_NAME}..."
+    docker build \
+        --build-arg "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
+        --build-arg "RUNC_FLAVOR=${RUNC_FLAVOR}" \
+        -t "${IMAGE_NAME}" \
+        -f images/containerd-local-test/Dockerfile .
+fi
 
 # If no command is provided, default to critest
 if [ $# -eq 0 ]; then
@@ -59,9 +88,9 @@ if [ -d "/etc/apparmor.d" ]; then
 fi
 
 docker run --rm --privileged \
-    -e "RUNTIME=${RUNTIME:-io.containerd.runc.v2}" \
+    -e "RUNTIME=${RUNTIME}" \
     -v "${BINARY_DIR}:/usr/local/bin/critest-tools:ro" \
-    -v "containerd-local-test-data:/var/lib/containerd" \
+    -v "${DATA_VOLUME}:/var/lib/containerd" \
     ${OPTIONAL_MOUNTS[@]+"${OPTIONAL_MOUNTS[@]}"} \
     "${IMAGE_NAME}" \
     "$@"

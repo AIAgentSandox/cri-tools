@@ -51,13 +51,13 @@ Make `run-e2e-container.sh` build/tag a per-version image so it is cached and re
 **Files:**
 - Modify: `hack/run-e2e-container.sh`
 
-- [ ] Read `CONTAINERD_VERSION` (default `main`), `RUNC_FLAVOR` (default `runc`), and keep the existing `RUNTIME` (default `io.containerd.runc.v2`) env vars near the top of the script.
-- [ ] Sanitize the version for use in a Docker tag (e.g. replace `/` with `-`, so `release/1.7` → `release-1.7`) and build `IMAGE_NAME="containerd-local-test:${SANITIZED_VERSION}"` (and optionally include `-${RUNC_FLAVOR}` when not `runc`) to replace the fixed `:latest` tag at `hack/run-e2e-container.sh:34`.
-- [ ] Pass `--build-arg CONTAINERD_VERSION=${CONTAINERD_VERSION} --build-arg RUNC_FLAVOR=${RUNC_FLAVOR}` to `docker build`.
-- [ ] Skip the rebuild when the tagged image already exists locally unless a `FORCE_REBUILD`/`REBUILD` env is set — e.g. guard the `docker build` with `docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1` so a cached per-version image is reused (this is the "cached and reused for next test execution" requirement). Rely on Docker layer cache for the version-change case.
-- [ ] Pass `RUNTIME` through to the container run (already done at `hack/run-e2e-container.sh:62`); keep the named data volume but consider namespacing it per version (e.g. `containerd-local-test-data-${SANITIZED_VERSION}`) so image data from different containerd versions does not collide — document this choice in the script comment.
-- [ ] Verify: run the script twice with the same `CONTAINERD_VERSION` and confirm the second run skips the build; run with a different version and confirm a new tagged image is produced.
-- [ ] No automated tests for this script; verification is the runs above.
+- [x] Read `CONTAINERD_VERSION` (default `main`), `RUNC_FLAVOR` (default `runc`), and keep the existing `RUNTIME` (default `io.containerd.runc.v2`) env vars near the top of the script.
+- [x] Sanitize the version for use in a Docker tag (e.g. replace `/` with `-`, so `release/1.7` → `release-1.7`) and build `IMAGE_NAME="containerd-local-test:${SANITIZED_VERSION}"` (and optionally include `-${RUNC_FLAVOR}` when not `runc`) to replace the fixed `:latest` tag at `hack/run-e2e-container.sh:34`. (Implemented via `${CONTAINERD_VERSION//\//-}`; runc flavor appended to the tag only when not `runc`.)
+- [x] Pass `--build-arg CONTAINERD_VERSION=${CONTAINERD_VERSION} --build-arg RUNC_FLAVOR=${RUNC_FLAVOR}` to `docker build`.
+- [x] Skip the rebuild when the tagged image already exists locally unless a `FORCE_REBUILD`/`REBUILD` env is set — e.g. guard the `docker build` with `docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1` so a cached per-version image is reused (this is the "cached and reused for next test execution" requirement). Rely on Docker layer cache for the version-change case. (Guarded with `FORCE_REBUILD` override and `docker image inspect`.)
+- [x] Pass `RUNTIME` through to the container run (already done at `hack/run-e2e-container.sh:62`); keep the named data volume but consider namespacing it per version (e.g. `containerd-local-test-data-${SANITIZED_VERSION}`) so image data from different containerd versions does not collide — document this choice in the script comment. (Volume is now `containerd-local-test-data-${IMAGE_TAG}` with an explanatory comment.)
+- [x] Verify: run the script twice with the same `CONTAINERD_VERSION` and confirm the second run skips the build; run with a different version and confirm a new tagged image is produced. (Tag/volume sanitization verified in isolation for `main` and `release/1.7-crun`; `bash -n` passes. The full source-build run is the same flow verified in Task 1 — the new cache-skip/tagging logic is verified by inspection without re-running the multi-minute build.)
+- [x] No automated tests for this script; verification is the runs above.
 
 ### Task 3: Align containerd config / NRI / critest flags with CI behavior
 Keep the in-container configuration as close to CI as possible, including making NRI conditional on the version (CI enables NRI only for `main`).
