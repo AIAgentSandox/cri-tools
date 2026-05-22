@@ -269,10 +269,13 @@ test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with cont
 
 .PHONY: clean-critest-containerd-images
 clean-critest-containerd-images: ## Remove cached containerd-local-test images and data volumes so they are regenerated.
-	# Remove all per-version containerd-local-test images.
-	docker images --filter=reference='containerd-local-test:*' -q | sort -u | xargs -r docker rmi -f
+	# Remove all per-version containerd-local-test images. Guard the empty case
+	# without GNU-only `xargs -r` so the target also works on macOS/BSD.
+	images=$$(docker images --filter=reference='containerd-local-test:*' -q | sort -u); \
+	if [ -n "$$images" ]; then docker rmi -f $$images; fi
 	# Remove the per-version named data volumes (containerd-local-test-data-*).
-	docker volume ls --filter=name='containerd-local-test-data' -q | xargs -r docker volume rm -f
+	volumes=$$(docker volume ls --filter=name='containerd-local-test-data' -q); \
+	if [ -n "$$volumes" ]; then docker volume rm -f $$volumes; fi
 
 .PHONY: test-crictl
 test-crictl: $(GINKGO) ## Run the crictl test suite.

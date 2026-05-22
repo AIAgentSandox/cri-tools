@@ -157,11 +157,15 @@ make test-critest-containerd CONTAINERD_VERSION=release/1.7
 make test-critest-containerd CONTAINERD_VERSION=main RUNC_FLAVOR=crun
 ```
 
-The built image is tagged per version (`containerd-local-test:<version>`) and
-each version gets its own data volume, so images are cached and reused across
-runs — only a changed `CONTAINERD_VERSION`/`RUNC_FLAVOR` triggers a rebuild
-(set `FORCE_REBUILD=1` to force one). To delete the cached images and volumes
-so they are regenerated:
+critest runs with `--parallel=8` by default (mirroring CI); override with
+`make test-critest-containerd PARALLEL=4`.
+
+The built image is tagged per version (`containerd-local-test:<version>`, with
+`-<flavor>` appended for a non-default `RUNC_FLAVOR`, e.g.
+`containerd-local-test:main-crun`) and each version gets its own data volume,
+so images are cached and reused across runs — only a changed
+`CONTAINERD_VERSION`/`RUNC_FLAVOR` triggers a rebuild (set `FORCE_REBUILD=1` to
+force one). To delete the cached images and volumes so they are regenerated:
 
 ```bash
 make clean-critest-containerd-images

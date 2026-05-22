@@ -62,8 +62,9 @@ DATA_VOLUME="containerd-local-test-data-${IMAGE_TAG}"
 
 # Build the runner image, tagged per containerd version so it is cached and
 # reused on subsequent runs. Skip the build when the tagged image already
-# exists locally unless FORCE_REBUILD is set; Docker's layer cache handles the
-# version-change case when a new tag is requested.
+# exists locally unless FORCE_REBUILD is set. A changed CONTAINERD_VERSION /
+# RUNC_FLAVOR produces a new tag, so it builds a fresh image rather than
+# reusing the cached one.
 if [ -z "${FORCE_REBUILD:-}" ] && docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
     echo "Reusing cached image ${IMAGE_NAME} (set FORCE_REBUILD=1 to rebuild)..."
 else
