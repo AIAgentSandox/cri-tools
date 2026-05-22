@@ -104,12 +104,18 @@ Expose `CONTAINERD_VERSION` (and `RUNC_FLAVOR`/`RUNTIME`) through the Makefile s
    - Option B: Keep apt but pin a released `containerd=<version>` package. Faster build, but versions diverge from CI (CI tests branch tips like `main`/`release/1.7`, not apt releases), and apt may not offer the exact versions.
    - **Suggested: Option A** — the task explicitly asks to "align as much with CI" and "support different containerd versions"; CI builds from source at branch refs, so source build is the only way to truly match.
 
+Answer: Option A - build from sources.
+
 2. **What should the default `CONTAINERD_VERSION` be?**
    - Option A: `main` (matches CI's primary matrix entry and the NRI-enabled path).
    - Option B: `release/1.7` (the LTS-ish branch).
    - **Suggested: Option A (`main`)** — it is the configuration CI exercises most fully (NRI on), so the default local run mirrors the richest CI path.
 
+Answer: Option A - same as CI - main
+
 3. **Should the data volume be namespaced per containerd version?**
    - Option A: Yes — `containerd-local-test-data-<version>` to avoid image-store/schema incompatibilities between containerd versions.
    - Option B: No — keep a single shared `containerd-local-test-data` volume (simpler, but risks corruption when switching versions).
    - **Suggested: Option A** — different containerd versions can use incompatible content/metadata stores, and per-version volumes keep the cache-and-reuse behavior safe; the clean target removes all of them.
+
+Answer: Option A - Yes, per version
