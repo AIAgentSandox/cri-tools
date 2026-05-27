@@ -260,11 +260,11 @@ pin check is happy.
 **Files:**
 - Modify: none (verification only).
 
-- [ ] Run `make verify-zizmor` — must exit 0.
-- [ ] Run `make verify-dependencies` — must exit 0.
-- [ ] Run `make verify` — must exit 0 (this now also runs
+- [x] Run `make verify-zizmor` — must exit 0.
+- [x] Run `make verify-dependencies` — must exit 0.
+- [x] Run `make verify` — must exit 0 (this now also runs
       `verify-zizmor`).
-- [ ] Skim the diff of the four workflow files and confirm no
+- [x] Skim the diff of the four workflow files and confirm no
       semantic behavior change beyond the zizmor fixes (e.g. checkout
       `fetch-depth`, action SHAs, conditionals all intact).
 
