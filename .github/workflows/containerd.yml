@@ -95,9 +95,9 @@ jobs:
           path: src/github.com/Microsoft/hcsshim
           persist-credentials: false
 
-      - name: Cache go modules and build cache
-        if: github.event_name != 'pull_request'
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5 # zizmor: ignore[cache-poisoning] guarded by if:, untrusted PRs cannot save the cache
+      # Paired with "Save go modules and build cache" at end of job.
+      - name: Restore go modules and build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             ~/go/pkg/mod
@@ -406,3 +406,15 @@ jobs:
         run: |
           echo "Cleanup temp directory $CONTD_CRI_DIR created for cri tests"
           rm -rf "$CONTD_CRI_DIR"
+
+      # Paired with "Restore go modules and build cache" near top of job.
+      # Placed here so the cache includes dependencies fetched during the build.
+      - name: Save go modules and build cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+            '%LocalAppData%\go-build' # Windows
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}

@@ -63,7 +63,8 @@ GINKGO := $(BUILD_BIN_PATH)/ginkgo
 GOLANGCI_LINT_DIR := $(BUILD_BIN_PATH)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(GOLANGCI_LINT_DIR)/golangci-lint
 ZEITGEIST := $(BUILD_BIN_PATH)/zeitgeist
-ZIZMOR := $(BUILD_BIN_PATH)/zizmor
+ZIZMOR_DIR := $(BUILD_BIN_PATH)/zizmor-$(ZIZMOR_VERSION)
+ZIZMOR := $(ZIZMOR_DIR)/zizmor
 VERIFY_BOILERPLATE := $(BUILD_BIN_PATH)/verify_boilerplate.py
 
 CRITEST := $(BUILD_BIN_PATH)/critest$(BIN_EXT)
@@ -224,7 +225,8 @@ $(ZIZMOR): $(BUILD_BIN_PATH)
 	curl -sSfL --retry 5 --retry-delay 3 \
 		"https://github.com/zizmorcore/zizmor/releases/download/$(ZIZMOR_VERSION)/zizmor-$$target.tar.gz" \
 		-o "$$tmp"; \
-	tar -xzf "$$tmp" -C $(BUILD_BIN_PATH) zizmor; \
+	mkdir -p $(ZIZMOR_DIR); \
+	tar -xzf "$$tmp" -C $(ZIZMOR_DIR) zizmor; \
 	chmod +x $(ZIZMOR)
 
 .PHONY: verify-go-modules

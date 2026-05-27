@@ -40,6 +40,15 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # Paired with "Save go modules and build cache" at end of job.
+      - name: Restore go modules and build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+
       - name: Setup system
         run: |
           # enable necessary kernel modules
@@ -145,3 +154,14 @@ jobs:
         with:
           name: ${{matrix.suite}}-${{matrix.oci-runtime}}-${{matrix.monitor}}-${{github.sha}}.log
           path: journal.log
+
+      # Paired with "Restore go modules and build cache" near top of job.
+      # Placed here so the cache includes dependencies fetched during the build.
+      - name: Save go modules and build cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
