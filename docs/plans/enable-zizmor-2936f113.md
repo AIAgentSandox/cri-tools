@@ -176,7 +176,7 @@ input on line 388.)
 **Files:**
 - Modify: `.github/workflows/containerd.yml`
 
-- [ ] Around `containerd.yml:381` — the
+- [x] Around `containerd.yml:381` — the
       `actions/upload-artifact` step's `path:` is an action input, not
       a `run:` block; if zizmor still flags it after the other fixes,
       add `env: { CONTD_CRI_DIR: ${{ env.CONTD_CRI_DIR }} }` on the
@@ -184,13 +184,16 @@ input on line 388.)
       supported, otherwise leave the `path:` expression alone and add
       a zizmor inline ignore comment scoped to that single line with a
       short justification. Verify the fix matches what zizmor accepts.
-- [ ] `containerd.yml:393-397` (Linux cleanup `run:` block) —
+      (Verified — zizmor only flags the `run:` blocks, not the
+      `path:` action input, so no change to the upload-artifact step
+      was required.)
+- [x] `containerd.yml:393-397` (Linux cleanup `run:` block) —
       replace `${{env.CONTD_CRI_DIR}}` with `"$CONTD_CRI_DIR"` in both
       the `echo` and `sudo rm -rf` lines.
-- [ ] `containerd.yml:399-404` (Windows cleanup `run:` block) — same
+- [x] `containerd.yml:399-404` (Windows cleanup `run:` block) — same
       replacement, ensuring the bash shell semantics still work under
       `shell: bash` on Windows.
-- [ ] Re-run `make verify-zizmor` and confirm all
+- [x] Re-run `make verify-zizmor` and confirm all
       `template-injection` findings are gone.
 
 ### Task 6: Fix `artipacked` findings (9 checkouts)

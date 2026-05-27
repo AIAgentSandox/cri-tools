@@ -394,12 +394,12 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         shell: bash
         run: |
-          echo "Cleanup temp directory ${{env.CONTD_CRI_DIR}} created for cri tests"
-          sudo rm -rf ${{env.CONTD_CRI_DIR}}
+          echo "Cleanup temp directory $CONTD_CRI_DIR created for cri tests"
+          sudo rm -rf "$CONTD_CRI_DIR"
 
       - name: Cleanup temp directory on Windows
         if: startsWith(matrix.os, 'windows')
         shell: bash
         run: |
-          echo "Cleanup temp directory ${{env.CONTD_CRI_DIR}} created for cri tests"
-          rm -rf ${{env.CONTD_CRI_DIR}}
+          echo "Cleanup temp directory $CONTD_CRI_DIR created for cri tests"
+          rm -rf "$CONTD_CRI_DIR"
