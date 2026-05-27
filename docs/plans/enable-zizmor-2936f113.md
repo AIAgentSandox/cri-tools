@@ -113,10 +113,10 @@ bumps are picked up consistently.
 **Files:**
 - Modify: `dependencies.yaml`
 
-- [ ] Add a `zizmor` entry with `version: v1.25.2` and a `refPaths`
+- [x] Add a `zizmor` entry with `version: v1.25.2` and a `refPaths`
       entry pointing to `Makefile` matching `ZIZMOR_VERSION` — same
       shape as the existing `zeitgeist`/`golangci-lint` entries.
-- [ ] Run `make verify-dependencies` and confirm it passes.
+- [x] Run `make verify-dependencies` and confirm it passes.
 
 ### Task 3: Add zizmor to the build workflow's `linters` matrix
 
