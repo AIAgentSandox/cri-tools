@@ -32,10 +32,10 @@ jobs:
         run: |
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" _output/releases/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md
           else
             gh release create "$GITHUB_REF_NAME" _output/releases/* \
-              --notes-file release-notes.md \
-              --target "$GITHUB_SHA"
+              --notes-file release-notes.md
           fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

@@ -204,22 +204,27 @@ $(ZEITGEIST): $(BUILD_BIN_PATH)
 
 .PHONY: verify-zizmor
 verify-zizmor: $(ZIZMOR) ## Run zizmor on .github/workflows/.
-	$(ZIZMOR) .github/workflows/
+	@if [ -x "$(ZIZMOR)" ]; then \
+		$(ZIZMOR) .github/workflows/; \
+	else \
+		echo "Skipping verify-zizmor: no zizmor binary for $(GOOS)/$(GOARCH)."; \
+	fi
 
 $(ZIZMOR): $(BUILD_BIN_PATH)
-	@case "$(GOOS)/$(GOARCH)" in \
+	@set -e; \
+	case "$(GOOS)/$(GOARCH)" in \
 		linux/amd64)  target=x86_64-unknown-linux-gnu  ;; \
 		linux/arm64)  target=aarch64-unknown-linux-gnu ;; \
 		darwin/amd64) target=x86_64-apple-darwin       ;; \
 		darwin/arm64) target=aarch64-apple-darwin      ;; \
-		*) echo "unsupported host $(GOOS)/$(GOARCH) for zizmor" >&2; exit 1 ;; \
+		*) echo "skipping zizmor install: unsupported host $(GOOS)/$(GOARCH)" >&2; exit 0 ;; \
 	esac; \
 	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
 	curl -sSfL --retry 5 --retry-delay 3 \
 		"https://github.com/zizmorcore/zizmor/releases/download/$(ZIZMOR_VERSION)/zizmor-$$target.tar.gz" \
 		-o "$$tmp"; \
 	tar -xzf "$$tmp" -C $(BUILD_BIN_PATH) zizmor; \
-	rm -f "$$tmp"; \
 	chmod +x $(ZIZMOR)
 
 .PHONY: verify-go-modules
@@ -322,7 +327,7 @@ test-crictl: $(GINKGO) ## Run the crictl test suite.
 ##@ Utility targets:
 
 .PHONY: install.tools
-install.tools: $(GINKGO) $(GOLANGCI_LINT) ## Install all required verification tools.
+install.tools: $(GINKGO) $(GOLANGCI_LINT) $(ZIZMOR) ## Install all required verification tools.
 
 .PHONY: install.ginkgo
 install.ginkgo: $(GINKGO) ## Install ginkgo.
