@@ -57,11 +57,13 @@ ZEITGEIST_VERSION = v0.5.3
 GOLANGCI_LINT_VERSION := v2.12.2
 REPO_INFRA_VERSION = v0.2.6
 PRETTIER_VERSION = 3.8.3
+ZIZMOR_VERSION := v1.25.2
 
 GINKGO := $(BUILD_BIN_PATH)/ginkgo
 GOLANGCI_LINT_DIR := $(BUILD_BIN_PATH)/golangci-lint-$(GOLANGCI_LINT_VERSION)
 GOLANGCI_LINT := $(GOLANGCI_LINT_DIR)/golangci-lint
 ZEITGEIST := $(BUILD_BIN_PATH)/zeitgeist
+ZIZMOR := $(BUILD_BIN_PATH)/zizmor
 VERIFY_BOILERPLATE := $(BUILD_BIN_PATH)/verify_boilerplate.py
 
 CRITEST := $(BUILD_BIN_PATH)/critest$(BIN_EXT)
@@ -143,7 +145,7 @@ release: ## Build a release.
 ##@ Verify targets:
 
 .PHONY: verify
-verify: verify-lint verify-boilerplate verify-docs verify-dependencies verify-go-modules verify-prettier ## Run all verify targets.
+verify: verify-lint verify-boilerplate verify-docs verify-dependencies verify-go-modules verify-prettier verify-zizmor ## Run all verify targets.
 
 .PHONY: verify-lint
 verify-lint: $(GOLANGCI_LINT) ## Run golangci-lint for the current OS, linux, and windows.
@@ -199,6 +201,26 @@ verify-dependencies: $(BUILD_BIN_PATH)/zeitgeist ## Verify third party dependenc
 
 $(ZEITGEIST): $(BUILD_BIN_PATH)
 	$(call curl_to,https://storage.googleapis.com/k8s-artifacts-sig-release/kubernetes-sigs/zeitgeist/$(ZEITGEIST_VERSION)/zeitgeist-$(GOARCH)-$(GOOS),$(ZEITGEIST))
+
+.PHONY: verify-zizmor
+verify-zizmor: $(ZIZMOR) ## Run zizmor on .github/workflows/.
+	$(ZIZMOR) .github/workflows/
+
+$(ZIZMOR): $(BUILD_BIN_PATH)
+	@case "$(GOOS)/$(GOARCH)" in \
+		linux/amd64)  target=x86_64-unknown-linux-gnu  ;; \
+		linux/arm64)  target=aarch64-unknown-linux-gnu ;; \
+		darwin/amd64) target=x86_64-apple-darwin       ;; \
+		darwin/arm64) target=aarch64-apple-darwin      ;; \
+		*) echo "unsupported host $(GOOS)/$(GOARCH) for zizmor" >&2; exit 1 ;; \
+	esac; \
+	tmp=$$(mktemp); \
+	curl -sSfL --retry 5 --retry-delay 3 \
+		"https://github.com/zizmorcore/zizmor/releases/download/$(ZIZMOR_VERSION)/zizmor-$$target.tar.gz" \
+		-o "$$tmp"; \
+	tar -xzf "$$tmp" -C $(BUILD_BIN_PATH) zizmor; \
+	rm -f "$$tmp"; \
+	chmod +x $(ZIZMOR)
 
 .PHONY: verify-go-modules
 verify-go-modules: ## Verify vendored golang modules.
@@ -310,6 +332,9 @@ $(GINKGO):
 
 .PHONY: install.lint
 install.lint: $(GOLANGCI_LINT) ## Install golangci-lint.
+
+.PHONY: install.zizmor
+install.zizmor: $(ZIZMOR) ## Install zizmor.
 
 .PHONY: install.prettier
 install.prettier: ## Install prettier.

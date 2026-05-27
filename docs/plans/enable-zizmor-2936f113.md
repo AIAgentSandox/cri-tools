@@ -79,11 +79,11 @@ but adapt for a tarball asset.
 **Files:**
 - Modify: `Makefile`
 
-- [ ] Add `ZIZMOR_VERSION := v1.25.2` near the other tool-version
+- [x] Add `ZIZMOR_VERSION := v1.25.2` near the other tool-version
       constants around `Makefile:56-59`.
-- [ ] Add `ZIZMOR := $(BUILD_BIN_PATH)/zizmor` near the other binary
+- [x] Add `ZIZMOR := $(BUILD_BIN_PATH)/zizmor` near the other binary
       path vars around `Makefile:61-65`.
-- [ ] Add a `$(ZIZMOR): $(BUILD_BIN_PATH)` recipe that detects host
+- [x] Add a `$(ZIZMOR): $(BUILD_BIN_PATH)` recipe that detects host
       `GOOS`/`GOARCH`, maps them to the Rust target triple (Linux:
       `x86_64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu`, macOS:
       `x86_64-apple-darwin` / `aarch64-apple-darwin`), `curl`s the
@@ -91,16 +91,16 @@ but adapt for a tarball asset.
       `curl_to`, extracts only the `zizmor` binary into
       `$(BUILD_BIN_PATH)`, and `chmod +x`es it. Place this near the
       `$(ZEITGEIST)` recipe.
-- [ ] Add `.PHONY: verify-zizmor` plus a target
+- [x] Add `.PHONY: verify-zizmor` plus a target
       `verify-zizmor: $(ZIZMOR) ## Run zizmor on .github/workflows/.`
       that runs `$(ZIZMOR) .github/workflows/` (the default
       `min-severity` of low matches the findings list in the task).
-- [ ] Add `.PHONY: install.zizmor` plus
+- [x] Add `.PHONY: install.zizmor` plus
       `install.zizmor: $(ZIZMOR) ## Install zizmor.` mirroring
       `install.lint`.
-- [ ] Extend the aggregate `verify:` target at `Makefile:146` to
+- [x] Extend the aggregate `verify:` target at `Makefile:146` to
       include `verify-zizmor`.
-- [ ] Write/update tests (if the repository has test coverage for
+- [x] Write/update tests (if the repository has test coverage for
       similar code) — N/A; Makefile changes are validated by running
       `make verify-zizmor` and confirming it builds the binary and
       exits 0 once Task 4 lands.
