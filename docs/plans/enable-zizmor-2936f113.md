@@ -128,9 +128,9 @@ setup-go findings on this same job are fixed in Task 4.)
 **Files:**
 - Modify: `.github/workflows/build.yml`
 
-- [ ] Add `- zizmor` to the matrix `run:` list at
+- [x] Add `- zizmor` to the matrix `run:` list at
       `build.yml:28-33`.
-- [ ] Confirm `make verify-zizmor` is what the new matrix entry will
+- [x] Confirm `make verify-zizmor` is what the new matrix entry will
       invoke and that no extra steps (e.g. an apt package) are needed
       on `ubuntu-latest` — the Makefile recipe downloads a static
       binary.
