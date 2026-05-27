@@ -208,21 +208,21 @@ None of the listed jobs push back to git via the local checkout.
   `.github/workflows/containerd.yml`, `.github/workflows/crio.yml`,
   `.github/workflows/release.yml`
 
-- [ ] `build.yml:19,35,47,66,80,88` — add `with: { persist-credentials: false }`
+- [x] `build.yml:19,35,47,66,80,88` — add `with: { persist-credentials: false }`
       to each checkout step. For checkouts that already have a `with:`
       block (e.g. line 66 has `fetch-depth: 0`, line 35 may merge with
       existing keys) extend that block instead of creating a duplicate.
-- [ ] `containerd.yml:30` (and any other unannotated checkouts in
+- [x] `containerd.yml:30` (and any other unannotated checkouts in
       the file — there are several inside the same job) — add
       `persist-credentials: false` to each. The
       `containerd/containerd` and `Microsoft/hcsshim` checkouts are
       external repos, so the option is even more clearly correct
       there.
-- [ ] `crio.yml:32` — add `persist-credentials: false` to the
+- [x] `crio.yml:32` — add `persist-credentials: false` to the
       checkout step.
-- [ ] `release.yml:16` — add `persist-credentials: false` under the
+- [x] `release.yml:16` — add `persist-credentials: false` under the
       existing `with:` block that holds `fetch-depth: 0`.
-- [ ] Re-run `make verify-zizmor` and confirm all
+- [x] Re-run `make verify-zizmor` and confirm all
       `artipacked` findings are gone.
 
 ### Task 7: Replace `ncipollo/release-action` with built-in `gh release create`
