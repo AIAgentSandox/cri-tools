@@ -235,19 +235,21 @@ shell step.
 **Files:**
 - Modify: `.github/workflows/release.yml`
 
-- [ ] Replace the `- uses: ncipollo/release-action@…` block at
+- [x] Replace the `- uses: ncipollo/release-action@…` block at
       `release.yml:25-30` with a `run:` step that calls
       `gh release create "$GITHUB_REF_NAME" _output/releases/* --notes-file release-notes.md --target "$GITHUB_SHA"`
       (use `--clobber` semantics via `gh release upload` if updates to
       an existing tag are required to match the previous
-      `allowUpdates: true` behavior — see Question 1).
-- [ ] Add `permissions: contents: write` at the job level on the
+      `allowUpdates: true` behavior — see Question 1). Implemented
+      Option A: `gh release view` guard, then either `gh release
+      upload --clobber` or `gh release create`.
+- [x] Add `permissions: contents: write` at the job level on the
       `publish` job so `gh release create` can write — keep the
       top-level `contents: read` default.
-- [ ] Set `GH_TOKEN: ${{ secrets.GH_TOKEN }}` on the step env so
+- [x] Set `GH_TOKEN: ${{ secrets.GH_TOKEN }}` on the step env so
       `gh` authenticates with the same token the previous action used
       (the file comment at `release.yml:6-7` already notes this).
-- [ ] Re-run `make verify-zizmor` and confirm the
+- [x] Re-run `make verify-zizmor` and confirm the
       `superfluous-actions` finding is gone.
 
 ### Task 8: Final verification

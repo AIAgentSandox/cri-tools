@@ -3,7 +3,7 @@ on:
   push:
     tags:
       - "*"
-# `make release-notes release` and ncipollo/release-action authenticate via
+# `make release-notes release` and `gh release` authenticate via
 # secrets.GH_TOKEN; the default GITHUB_TOKEN only needs read access.
 permissions:
   contents: read
@@ -12,6 +12,8 @@ jobs:
   publish:
     name: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -24,12 +26,17 @@ jobs:
       - run: make release-notes release
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
-      - uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
-        with:
-          allowUpdates: true
-          artifacts: _output/releases/*
-          bodyFile: release-notes.md
-          token: ${{ secrets.GH_TOKEN }}
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" _output/releases/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" _output/releases/* \
+              --notes-file release-notes.md \
+              --target "$GITHUB_SHA"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
