@@ -147,18 +147,21 @@ rely on warm Go caches and the only file already using
 - Modify: `.github/workflows/build.yml`, `.github/workflows/crio.yml`,
   `.github/workflows/release.yml`, `.github/workflows/containerd.yml`
 
-- [ ] `build.yml:38`, `build.yml:50`, `build.yml:71` — add
+- [x] `build.yml:38`, `build.yml:50`, `build.yml:71` — add
       `cache: false` under the existing `with:` block of each
       `actions/setup-go` step (copy the pattern already used at
       `containerd.yml:72`).
-- [ ] `crio.yml:36` — add `cache: false` under that step's `with:`.
-- [ ] `release.yml:19` — add `cache: false` under that step's `with:`.
-- [ ] `containerd.yml:95-102` — convert the `actions/cache` step to
+- [x] `crio.yml:36` — add `cache: false` under that step's `with:`.
+- [x] `release.yml:19` — add `cache: false` under that step's `with:`.
+- [x] `containerd.yml:95-102` — convert the `actions/cache` step to
       restore-only on PRs: add
       `lookup-only: ${{ github.event_name == 'pull_request' }}` (or
       equivalent guard) so untrusted PR runs cannot overwrite the
       shared cache. Match the fix wording in the task description.
-- [ ] Re-run `make verify-zizmor` and confirm all
+      (Implemented as `if: github.event_name != 'pull_request'` plus a
+      `zizmor: ignore[cache-poisoning]` inline comment because zizmor's
+      static analysis does not recognize the `if:` mitigation.)
+- [x] Re-run `make verify-zizmor` and confirm all
       `cache-poisoning` findings are gone.
 
 ### Task 5: Fix `template-injection` in `containerd.yml`
