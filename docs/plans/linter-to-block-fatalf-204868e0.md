@@ -30,16 +30,16 @@ Activate the linter that will block `Fatal`-style abort calls, and define patter
 **Files:**
 - Modify: `.golangci.yml`
 
-- [ ] In `linters.enable`, add `- forbidigo` (alphabetically, between `fatcontext` and `forcetypeassert`). Remove the matching `# - forbidigo` line in the disabled block at the bottom of the `enable:` list so the two lists stay consistent with the existing style.
-- [ ] Under `linters.settings`, add a `forbidigo:` block that disables type analysis (regex-only is sufficient and keeps the rule cheap) and defines the forbidden patterns. Use named `pattern` / `msg` entries so messages are descriptive:
+- [x] In `linters.enable`, add `- forbidigo` (alphabetically, between `fatcontext` and `forcetypeassert`). Remove the matching `# - forbidigo` line in the disabled block at the bottom of the `enable:` list so the two lists stay consistent with the existing style.
+- [x] Under `linters.settings`, add a `forbidigo:` block that disables type analysis (regex-only is sufficient and keeps the rule cheap) and defines the forbidden patterns. Use named `pattern` / `msg` entries so messages are descriptive:
   - `^logrus\.Fatal.*$` — message: "use error returns instead of logrus.Fatal*; let main() print and exit with non-zero (see PR #2106)"
   - `^log\.Fatal.*$` — message: "use error returns instead of log.Fatal*; let main() print and exit with non-zero (see PR #2106)"
   - `^klog\.Fatal.*$` — message: "use error returns instead of klog.Fatal*; let main() print and exit with non-zero (see PR #2106)"
   - Set `exclude-godoc-examples: true` (default) and `analyze-types: false` so the rule is purely textual and doesn't slow the linter run.
-- [ ] Under `linters.exclusions.rules`, add a carve-out exempting `_test\.go$` from `forbidigo` for symmetry with the other path-scoped exclusions already present (defensive — current regexes don't match `t.Fatal*`, but this guards against future patterns like `klog.Fatal` in test helpers).
-- [ ] Keep ordering and indentation consistent with the rest of the file (two-space indent, alphabetical within `enable:`, settings sub-blocks alphabetical under `settings:`).
-- [ ] Run `make install.lint` if `golangci-lint` is not yet installed locally, then run `make verify-lint` and confirm it still passes on a clean tree (no regressions on the current code, which has zero matching patterns).
-- [ ] Tests: this repo has no unit-test harness for lint config, so no Go test changes are required for this task. Validation is performed in Task 2.
+- [x] Under `linters.exclusions.rules`, add a carve-out exempting `_test\.go$` from `forbidigo` for symmetry with the other path-scoped exclusions already present (defensive — current regexes don't match `t.Fatal*`, but this guards against future patterns like `klog.Fatal` in test helpers).
+- [x] Keep ordering and indentation consistent with the rest of the file (two-space indent, alphabetical within `enable:`, settings sub-blocks alphabetical under `settings:`).
+- [x] Run `make install.lint` if `golangci-lint` is not yet installed locally, then run `make verify-lint` and confirm it still passes on a clean tree (no regressions on the current code, which has zero matching patterns).
+- [x] Tests: this repo has no unit-test harness for lint config, so no Go test changes are required for this task. Validation is performed in Task 2.
 
 ### Task 2: Manually verify the rule fires on a regression
 Confirm that the configured linter actually rejects `log.Fatalf` / `logrus.Fatalf` / `klog.Fatalf` if they are reintroduced. This is a throwaway local check — do not commit the fixture.
