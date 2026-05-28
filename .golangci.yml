@@ -128,11 +128,11 @@ linters:
       analyze-types: false
       forbid:
         - pattern: ^logrus\.Fatal.*$
-          msg: use error returns instead of logrus.Fatal*; let main() print and exit with non-zero (see PR #2106)
+          msg: "use error returns instead of logrus.Fatal*; let main() print and exit with non-zero (see PR #2106)"
         - pattern: ^log\.Fatal.*$
-          msg: use error returns instead of log.Fatal*; let main() print and exit with non-zero (see PR #2106)
+          msg: "use error returns instead of log.Fatal*; let main() print and exit with non-zero (see PR #2106)"
         - pattern: ^klog\.Fatal.*$
-          msg: use error returns instead of klog.Fatal*; let main() print and exit with non-zero (see PR #2106)
+          msg: "use error returns instead of klog.Fatal*; let main() print and exit with non-zero (see PR #2106)"
     gocognit:
       min-complexity: 71
     gocritic:
