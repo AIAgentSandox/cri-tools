@@ -47,11 +47,11 @@ Confirm that the configured linter actually rejects `log.Fatalf` / `logrus.Fatal
 **Files:**
 - Temporary (do not commit): a scratch edit to one file under `cmd/crictl/`, e.g. `cmd/crictl/main.go`.
 
-- [ ] In a working-copy-only edit, replace the `logrus.Error(err)` + `os.Exit(1)` pair in `cmd/crictl/main.go:60-63` with `logrus.Fatal(err)` (single line).
-- [ ] Run `make verify-lint`. Confirm `forbidigo` reports the new line with the configured message and that exit status is non-zero.
-- [ ] Revert the scratch edit with `git checkout -- cmd/crictl/main.go` and re-run `make verify-lint` to confirm a clean tree still passes.
-- [ ] Repeat the spot-check for `log.Fatalf("x")` and `klog.Fatal("x")` (using temporary edits) to confirm all three regexes fire, then revert.
-- [ ] Tests: none — this task is a manual lint-rule self-test, not a unit test.
+- [x] In a working-copy-only edit, replace the `logrus.Error(err)` + `os.Exit(1)` pair in `cmd/crictl/main.go:60-63` with `logrus.Fatal(err)` (single line).
+- [x] Run `make verify-lint`. Confirm `forbidigo` reports the new line with the configured message and that exit status is non-zero.
+- [x] Revert the scratch edit with `git checkout -- cmd/crictl/main.go` and re-run `make verify-lint` to confirm a clean tree still passes.
+- [x] Repeat the spot-check for `log.Fatalf("x")` and `klog.Fatal("x")` (using temporary edits) to confirm all three regexes fire, then revert.
+- [x] Tests: none — this task is a manual lint-rule self-test, not a unit test.
 
 ### Task 3: Final repo check and commit
 Run the full verify suite to confirm no other linter is upset by the config changes, then commit.
