@@ -59,10 +59,10 @@ Run the full verify suite to confirm no other linter is upset by the config chan
 **Files:**
 - No additional file changes beyond Task 1.
 
-- [ ] Run `make verify-lint` for the current OS plus the `GOOS=linux` and `GOOS=windows` cross runs that the Makefile target performs (the target does this automatically).
-- [ ] Run `make verify` (or at minimum `make verify-lint`) to confirm the broader verify chain still passes.
-- [ ] Stage `.golangci.yml` only. Commit message body should briefly note the rule blocks `log.Fatal*`, `logrus.Fatal*`, `klog.Fatal*` to prevent regression of the PR #2106 cleanup, and that test files are exempted.
-- [ ] Tests: none — config-only change validated by lint runs in Tasks 1 and 2.
+- [x] Run `make verify-lint` for the current OS plus the `GOOS=linux` and `GOOS=windows` cross runs that the Makefile target performs (the target does this automatically).
+- [x] Run `make verify` (or at minimum `make verify-lint`) to confirm the broader verify chain still passes.
+- [x] Stage `.golangci.yml` only. Commit message body should briefly note the rule blocks `log.Fatal*`, `logrus.Fatal*`, `klog.Fatal*` to prevent regression of the PR #2106 cleanup, and that test files are exempted.
+- [x] Tests: none — config-only change validated by lint runs in Tasks 1 and 2.
 
 ## Questions
 
