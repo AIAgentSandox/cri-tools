@@ -49,7 +49,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	Context("StopPodSandbox state contract and idempotency", Serial, func() {
+	Context("StopPodSandbox contract", Serial, func() {
 		var (
 			testStub    *NRITestStub
 			podID       string

@@ -49,7 +49,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	Context("RunPodSandbox and CreateContainer failure, cleanup, and retry", Serial, func() {
+	Context("plugin error handling", Serial, func() {
 		var (
 			testStub  *NRITestStub
 			podID     string

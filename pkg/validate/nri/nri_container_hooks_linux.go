@@ -45,7 +45,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	Context("should invoke all container lifecycle hooks in order with correct metadata", Serial, func() {
+	Context("container lifecycle", Serial, func() {
 		var (
 			testStub    *NRITestStub
 			podID       string

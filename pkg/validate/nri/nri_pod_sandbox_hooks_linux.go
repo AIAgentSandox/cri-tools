@@ -42,7 +42,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		rc = f.CRIClient.CRIRuntimeClient
 	})
 
-	Context("should invoke all pod sandbox hooks in order with correct metadata", Serial, func() {
+	Context("pod sandbox lifecycle", Serial, func() {
 		var (
 			testStub  *NRITestStub
 			podID     string

@@ -46,7 +46,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		rc = f.CRIClient.CRIRuntimeClient
 	})
 
-	Context("Multi-plugin coordination", Serial, func() {
+	Context("multi-plugin coordination", Serial, func() {
 		var (
 			multiStub *NRIMultiStub
 			podID     string

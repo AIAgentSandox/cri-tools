@@ -48,7 +48,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		ic = f.CRIClient.CRIImageClient
 	})
 
-	Context("RunPodSandbox state contract and blocking behavior", Serial, func() {
+	Context("RunPodSandbox contract", Serial, func() {
 		var (
 			testStub  *NRITestStub
 			podID     string
