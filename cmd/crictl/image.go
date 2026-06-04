@@ -17,15 +17,15 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/docker/go-units"
@@ -36,42 +36,41 @@ import (
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
 
-type imageByRef []*pb.Image
+var pullFlags = []cli.Flag{
+	&cli.StringFlag{
+		Name:    "creds",
+		Usage:   "Use `USERNAME[:PASSWORD]` for accessing the registry",
+		EnvVars: []string{"CRICTL_CREDS"},
+	},
+	&cli.StringFlag{
+		Name:    "auth",
+		Usage:   "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
+		EnvVars: []string{"CRICTL_AUTH"},
+	},
+	&cli.StringFlag{
+		Name:    "username",
+		Aliases: []string{"u"},
+		Usage:   "Use `USERNAME` for accessing the registry. The password will be requested on the command line",
+	},
+	&cli.DurationFlag{
+		Name:    "pull-timeout",
+		Aliases: []string{"pt"},
+		Usage:   "Maximum time to be used for pulling the image, disabled if set to 0s",
+		EnvVars: []string{"CRICTL_PULL_TIMEOUT"},
+	},
+}
 
-func (a imageByRef) Len() int      { return len(a) }
-func (a imageByRef) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-func (a imageByRef) Less(i, j int) bool {
-	if len(a[i].GetRepoTags()) > 0 && len(a[j].GetRepoTags()) > 0 {
-		return a[i].GetRepoTags()[0] < a[j].GetRepoTags()[0]
-	}
-
-	if len(a[i].GetRepoDigests()) > 0 && len(a[j].GetRepoDigests()) > 0 {
-		return a[i].GetRepoDigests()[0] < a[j].GetRepoDigests()[0]
-	}
-
-	return a[i].GetId() < a[j].GetId()
+var cancelTimeoutFlag = &cli.DurationFlag{
+	Name:    "cancel-timeout",
+	Aliases: []string{"T"},
+	Usage:   "Seconds to wait for the request to complete before cancelling",
 }
 
 var pullImageCommand = &cli.Command{
 	Name:                   "pull",
 	Usage:                  "Pull an image from a registry",
 	UseShortOptionHandling: true,
-	Flags: []cli.Flag{
-		&cli.StringFlag{
-			Name:    "creds",
-			Usage:   "Use `USERNAME[:PASSWORD]` for accessing the registry",
-			EnvVars: []string{"CRICTL_CREDS"},
-		},
-		&cli.StringFlag{
-			Name:    "auth",
-			Usage:   "Use `AUTH_STRING` for accessing the registry. AUTH_STRING is a base64 encoded 'USERNAME[:PASSWORD]'",
-			EnvVars: []string{"CRICTL_AUTH"},
-		},
-		&cli.StringFlag{
-			Name:    "username",
-			Aliases: []string{"u"},
-			Usage:   "Use `USERNAME` for accessing the registry. The password will be requested on the command line",
-		},
+	Flags: append([]cli.Flag{
 		&cli.StringFlag{
 			Name:      "pod-config",
 			Usage:     "Use `pod-config.[json|yaml]` to override the pull c",
@@ -82,13 +81,7 @@ var pullImageCommand = &cli.Command{
 			Aliases: []string{"a"},
 			Usage:   "Annotation to be set on the pulled image",
 		},
-		&cli.DurationFlag{
-			Name:    "pull-timeout",
-			Aliases: []string{"pt"},
-			Usage:   "Maximum time to be used for pulling the image, disabled if set to 0s",
-			EnvVars: []string{"CRICTL_PULL_TIMEOUT"},
-		},
-	},
+	}, pullFlags...),
 	Subcommands: []*cli.Command{{
 		Name:      "jsonschema",
 		Aliases:   []string{"js"},
@@ -109,7 +102,7 @@ var pullImageCommand = &cli.Command{
 			return cli.ShowSubcommandHelp(c)
 		}
 
-		imageClient, err := getImageService(c)
+		imageClient, err := configFromContext(c).GetImageService(c.Context)
 		if err != nil {
 			return err
 		}
@@ -196,7 +189,7 @@ var listImageCommand = &cli.Command{
 			return cli.ShowSubcommandHelp(c)
 		}
 
-		imageClient, err := getImageService(c)
+		imageClient, err := configFromContext(c).GetImageService(c.Context)
 		if err != nil {
 			return err
 		}
@@ -336,7 +329,7 @@ var imageStatusCommand = &cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		imageClient, err := getImageService(c)
+		imageClient, err := configFromContext(c).GetImageService(c.Context)
 		if err != nil {
 			return err
 		}
@@ -442,7 +435,9 @@ the specified tag. To remove only a specific tag, use the container runtime's na
 		},
 	},
 	Action: func(cliCtx *cli.Context) error {
-		imageClient, err := getImageService(cliCtx)
+		cfg := configFromContext(cliCtx)
+
+		imageClient, err := cfg.GetImageService(cliCtx.Context)
 		if err != nil {
 			return err
 		}
@@ -481,7 +476,7 @@ the specified tag. To remove only a specific tag, use the container runtime's na
 
 		// On prune, remove images which are in use from the ID selector
 		if prune {
-			runtimeClient, err := getRuntimeService(cliCtx, 0)
+			runtimeClient, err := cfg.GetRuntimeService(cliCtx.Context, 0)
 			if err != nil {
 				return err
 			}
@@ -603,7 +598,7 @@ var imageFsInfoCommand = &cli.Command{
 		},
 	},
 	Action: func(c *cli.Context) error {
-		imageClient, err := getImageService(c)
+		imageClient, err := configFromContext(c).GetImageService(c.Context)
 		if err != nil {
 			return err
 		}
@@ -672,7 +667,7 @@ func getAuth(creds, auth, username string) (*pb.AuthConfig, error) {
 	if username != "" {
 		fmt.Print("Enter Password:")
 
-		bytePassword, err := term.ReadPassword(int(syscall.Stdin)) //nolint:unconvert // required for windows
+		bytePassword, err := term.ReadPassword(int(os.Stdin.Fd()))
 
 		fmt.Print("\n")
 
@@ -811,7 +806,17 @@ func ListImages(ctx context.Context, client internalapi.ImageManagerService, nam
 	resp := &pb.ListImagesResponse{Images: res}
 	logrus.Debugf("ListImagesResponse: %v", resp)
 
-	sort.Sort(imageByRef(resp.GetImages()))
+	slices.SortFunc(resp.GetImages(), func(a, b *pb.Image) int {
+		if len(a.GetRepoTags()) > 0 && len(b.GetRepoTags()) > 0 {
+			return cmp.Compare(a.GetRepoTags()[0], b.GetRepoTags()[0])
+		}
+
+		if len(a.GetRepoDigests()) > 0 && len(b.GetRepoDigests()) > 0 {
+			return cmp.Compare(a.GetRepoDigests()[0], b.GetRepoDigests()[0])
+		}
+
+		return cmp.Compare(a.GetId(), b.GetId())
+	})
 
 	if len(conditionFilters) > 0 && len(resp.GetImages()) > 0 {
 		resp.Images, err = filterImagesList(resp.GetImages(), conditionFilters)
@@ -949,7 +954,7 @@ func ImageStatus(ctx context.Context, client internalapi.ImageManagerService, im
 // the returned RemoveImageResponse.
 func RemoveImage(ctx context.Context, client internalapi.ImageManagerService, image string) error {
 	if image == "" {
-		return errors.New("ImageID cannot be empty")
+		return errIDEmpty
 	}
 
 	request := &pb.RemoveImageRequest{Image: &pb.ImageSpec{Image: image}}

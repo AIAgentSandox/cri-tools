@@ -21,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -56,10 +57,7 @@ var _ = framework.KubeDescribe("Container Mount Propagation", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		testMountPropagation := func(ctx context.Context, propagation runtimeapi.MountPropagation) {
@@ -152,10 +150,7 @@ var _ = framework.KubeDescribe("Container OOM", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		It("should terminate with exitCode 137 and reason OOMKilled", func(ctx SpecContext) {
@@ -355,10 +350,7 @@ var _ = framework.KubeDescribe("Container Mount Readonly", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		testRRO := func(ctx context.Context, rc internalapi.RuntimeService, ic internalapi.ImageManagerService, rro bool) {
@@ -552,4 +544,26 @@ func createMountContainer(
 	Expect(resp.GetStatus().GetMounts()).To(HaveLen(len(mounts)))
 
 	return containerID
+}
+
+// verifyLogContentsRe verifies the contents of container log using the provided regular expression pattern.
+func verifyLogContentsRe(ctx context.Context, podConfig *runtimeapi.PodSandboxConfig, logPath, pattern string, stream streamType) {
+	By("verify log contents using regex pattern")
+
+	msgs := parseLogLine(ctx, podConfig, logPath)
+
+	found := false
+
+	re, err := regexp.Compile(pattern)
+	Expect(err).NotTo(HaveOccurred(), "invalid regex pattern %q", pattern)
+
+	for _, msg := range msgs {
+		if re.MatchString(msg.log) && msg.stream == stream {
+			found = true
+
+			break
+		}
+	}
+
+	Expect(found).To(BeTrue(), "expected log pattern %q (stream=%q) to match logs %+v", pattern, stream, msgs)
 }

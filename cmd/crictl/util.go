@@ -33,6 +33,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/invopop/jsonschema"
 	"github.com/sirupsen/logrus"
+	"github.com/urfave/cli/v2"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/protoadapt"
 	"google.golang.org/protobuf/runtime/protoiface"
@@ -51,6 +52,8 @@ const (
 	outputTypeTable      = "table"
 	outputTypeGoTemplate = "go-template"
 )
+
+var errIDEmpty = errors.New("ID cannot be empty")
 
 var (
 	// The global stopCh for monitoring Interrupt signal.
@@ -73,7 +76,7 @@ func SetupInterruptSignalHandler() <-chan struct{} {
 			<-c
 			close(signalIntStopCh)
 			<-c
-			os.Exit(1) // Exit immediately on second signal
+			os.Exit(1) //nolint:forbidigo // intentional exit on second interrupt signal for immediate shutdown
 		}()
 	})
 
@@ -665,4 +668,95 @@ func AggregateGoroutines(funcs ...func() error) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+func truncateCount(total int, latest bool, last int) int {
+	n := total
+	if latest {
+		n = 1
+	}
+
+	if last > 0 {
+		n = last
+	}
+
+	return min(n, total)
+}
+
+func collectIDs[T interface{ GetId() string }](
+	ctx context.Context,
+	cliCtx *cli.Context,
+	listFn func(ctx context.Context) ([]T, error),
+	typeName string,
+) ([]string, error) {
+	ids := cliCtx.Args().Slice()
+	if cliCtx.Bool("all") {
+		items, err := InterruptableRPC(ctx, listFn)
+		if err != nil {
+			return nil, err
+		}
+
+		ids = nil
+		for _, item := range items {
+			ids = append(ids, item.GetId())
+		}
+	}
+
+	if len(ids) == 0 {
+		if cliCtx.Bool("all") {
+			logrus.Infof("No %ss to remove", typeName)
+
+			return nil, nil
+		}
+
+		return nil, cli.ShowSubcommandHelp(cliCtx)
+	}
+
+	return ids, nil
+}
+
+type statusResult interface {
+	GetInfo() map[string]string
+}
+
+func resourceStatus[T statusResult](
+	ctx context.Context,
+	ids []string,
+	output, tmplStr string,
+	quiet bool,
+	fetch func(ctx context.Context, id string, verbose bool) (T, error),
+	marshal func(T) (string, error),
+	table func(T, bool),
+) error {
+	verbose := !quiet
+
+	if output == "" {
+		output = outputTypeJSON
+	}
+
+	if len(ids) == 0 {
+		return errIDEmpty
+	}
+
+	statuses := []statusData{}
+
+	for _, id := range ids {
+		r, err := fetch(ctx, id, verbose)
+		if err != nil {
+			return err
+		}
+
+		statusJSON, err := marshal(r)
+		if err != nil {
+			return err
+		}
+
+		if output == outputTypeTable {
+			table(r, verbose)
+		} else {
+			statuses = append(statuses, statusData{json: statusJSON, info: r.GetInfo()})
+		}
+	}
+
+	return outputStatusData(statuses, output, tmplStr)
 }

@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 
@@ -74,14 +73,14 @@ var runtimeAttachCommand = &cli.Command{
 	Action: func(c *cli.Context) error {
 		id := c.Args().First()
 		if id == "" {
-			return errors.New("ID cannot be empty")
+			return errIDEmpty
 		}
 
 		if c.NArg() != 1 {
 			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, err := getRuntimeService(c, 0)
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
@@ -112,7 +111,7 @@ var runtimeAttachCommand = &cli.Command{
 // Attach sends an AttachRequest to server, and parses the returned AttachResponse.
 func Attach(ctx context.Context, client internalapi.RuntimeService, opts attachOptions) error {
 	if opts.id == "" {
-		return errors.New("ID cannot be empty")
+		return errIDEmpty
 	}
 
 	request := &pb.AttachRequest{

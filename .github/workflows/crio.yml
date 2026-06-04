@@ -6,6 +6,12 @@ on:
     branches:
       - master
   pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
 jobs:
   test:
     strategy:
@@ -21,15 +27,27 @@ jobs:
           - conmon
           - conmon-rs
     name: ${{matrix.suite}} / ${{matrix.oci-runtime}} / ${{matrix.monitor}}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout cri-tools
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Install go
         uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
         with:
           go-version-file: go.mod
+          cache: false
+
+      # Paired with "Save go modules and build cache" at end of job.
+      - name: Restore go modules and build cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
 
       - name: Setup system
         run: |
@@ -57,6 +75,16 @@ jobs:
         run: |
           sudo mkdir -p /etc/crio/crio.conf.d
           printf '[crio.runtime]\nlog_level = "debug"\n[crio.image]\nshort_name_mode = "disabled"\n' | sudo tee /etc/crio/crio.conf.d/01-log-level.conf
+
+      - name: Configure NRI for CRI-O
+        run: |
+          sudo mkdir -p /var/run/nri /opt/nri/plugins
+          sudo tee /etc/crio/crio.conf.d/05-nri.conf <<EOF
+          [crio.nri]
+          enable_nri = true
+          nri_listen = "/var/run/nri/nri.sock"
+          nri_plugin_dir = "/opt/nri/plugins"
+          EOF
 
       - name: Configure CRI-O to use conmon-rs instead of the default conmon
         if: ${{matrix.monitor == 'conmon-rs'}}
@@ -91,6 +119,7 @@ jobs:
           set +o errexit
           sudo -E PATH=$PATH critest \
             --runtime-endpoint=unix:///var/run/crio/crio.sock \
+            --nri-socket=/var/run/nri/nri.sock \
             --parallel=$(nproc) \
             --ginkgo.flake-attempts=3 \
             --ginkgo.randomize-all \
@@ -125,3 +154,14 @@ jobs:
         with:
           name: ${{matrix.suite}}-${{matrix.oci-runtime}}-${{matrix.monitor}}-${{github.sha}}.log
           path: journal.log
+
+      # Paired with "Restore go modules and build cache" near top of job.
+      # Placed here so the cache includes dependencies fetched during the build.
+      - name: Save go modules and build cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}

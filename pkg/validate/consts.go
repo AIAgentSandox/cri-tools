@@ -49,15 +49,16 @@ var (
 	checkPathLinuxCmd      = func(path string) []string { return []string{"ls", "-A", path} }
 
 	// Windows defaults.
-	echoHelloWindowsCmd      = []string{"powershell", "-c", "echo hello"}
-	sleepWindowsCmd          = []string{"powershell", "-c", "start-sleep 4321"}
-	checkSleepWindowsCmd     = []string{"powershell", "-c", "get-process | findstr sleep; exit 0"}
+	powershell               = "powershell"
+	echoHelloWindowsCmd      = []string{powershell, "-c", "echo hello"}
+	sleepWindowsCmd          = []string{powershell, "-c", "start-sleep 4321"}
+	checkSleepWindowsCmd     = []string{powershell, "-c", "get-process | findstr sleep; exit 0"}
 	shellWindowsCmd          = []string{"cmd", "/Q"}
-	pauseWindowsCmd          = []string{"powershell", "-c", "ping -t localhost"}
-	logDefaultWindowsCmd     = []string{"powershell", "-c", "echo '" + defaultLog + "'"}
-	loopLogDefaultWindowsCmd = []string{"powershell", "-c", "while($true) { echo '" + defaultLog + "'; sleep 1; }"}
+	pauseWindowsCmd          = []string{powershell, "-c", "ping -t localhost"}
+	logDefaultWindowsCmd     = []string{powershell, "-c", "echo '" + defaultLog + "'"}
+	loopLogDefaultWindowsCmd = []string{powershell, "-c", "while($true) { echo '" + defaultLog + "'; sleep 1; }"}
 	echoHelloWindowsOutput   = "hello\r\n"
-	checkPathWindowsCmd      = func(path string) []string { return []string{"powershell", "-c", "ls", path} }
+	checkPathWindowsCmd      = func(path string) []string { return []string{powershell, "-c", "ls", path} }
 )
 
 var _ = framework.AddBeforeSuiteCallback(func() {
@@ -198,27 +199,21 @@ const (
 	defaultDNSOption       string = "ndots:8"
 	webServerContainerPort int32  = 80
 	// The following host ports must not be in-use when running the test.
-	webServerHostPortForPortMapping        int32 = 12000
-	webServerHostPortForPortForward        int32 = 12001
-	webServerHostPortForHostNetPortFroward int32 = 12002
-	// The port used in hostNetNginxImage (See images/hostnet-nginx/).
-	webServerHostNetContainerPort int32 = 12003
+	webServerHostPortForPortMapping int32 = 12000
+	webServerHostPortForPortForward int32 = 12001
 
 	// Linux defaults.
-	webServerLinuxImage        = framework.DefaultRegistryE2ETestImagesPrefix + "nginx:1.14-2"
-	hostNetWebServerLinuxImage = registry + "hostnet-nginx-" + runtime.GOARCH
+	webServerLinuxImage = framework.DefaultRegistryE2ETestImagesPrefix + "nginx:1.14-2"
 
 	// Windows defaults.
-	webServerWindowsImage        = webServerLinuxImage
-	hostNetWebServerWindowsImage = webServerLinuxImage
+	webServerWindowsImage = webServerLinuxImage
 )
 
 var (
-	webServerImage        string
-	hostNetWebServerImage string
-	getDNSConfigCmd       []string
-	getDNSConfigContent   []string
-	getHostnameCmd        []string
+	webServerImage      string
+	getDNSConfigCmd     []string
+	getDNSConfigContent []string
+	getHostnameCmd      []string
 
 	// Linux defaults.
 	getDNSConfigLinuxCmd     = []string{"cat", resolvConfigPath}
@@ -243,13 +238,11 @@ var (
 var _ = framework.AddBeforeSuiteCallback(func() {
 	if runtime.GOOS != framework.OSWindows || framework.TestContext.IsLcow {
 		webServerImage = webServerLinuxImage
-		hostNetWebServerImage = hostNetWebServerLinuxImage
 		getDNSConfigCmd = getDNSConfigLinuxCmd
 		getDNSConfigContent = getDNSConfigLinuxContent
 		getHostnameCmd = getHostnameLinuxCmd
 	} else {
 		webServerImage = webServerWindowsImage
-		hostNetWebServerImage = hostNetWebServerWindowsImage
 		getDNSConfigCmd = getDNSConfigWindowsCmd
 		getDNSConfigContent = getDNSConfigWindowsContent
 		getHostnameCmd = getHostnameWindowsCmd

@@ -22,7 +22,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -77,10 +76,7 @@ var _ = framework.KubeDescribe("Container", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		It("runtime should support creating container [Conformance]", func(ctx SpecContext) {
@@ -339,10 +335,7 @@ var _ = framework.KubeDescribe("Container", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		It("runtime should support starting container with volume [Conformance]", func(ctx SpecContext) {
@@ -404,12 +397,7 @@ var _ = framework.KubeDescribe("Container", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("clean up the TempDir")
-			os.RemoveAll(hostPath)
+			framework.CleanupPodSandboxAndLogDir(ctx, rc, podID, hostPath)
 		})
 
 		It("runtime should support starting container with log [Conformance]", func(ctx SpecContext) {
@@ -762,25 +750,6 @@ func verifyLogContents(ctx context.Context, podConfig *runtimeapi.PodSandboxConf
 	}
 
 	Expect(found).To(BeTrue(), "expected log %q (stream=%q) not found in logs %+v", log, stream, msgs)
-}
-
-// verifyLogContentsRe verifies the contents of container log using the provided regular expression pattern.
-func verifyLogContentsRe(ctx context.Context, podConfig *runtimeapi.PodSandboxConfig, logPath, pattern string, stream streamType) {
-	By("verify log contents using regex pattern")
-
-	msgs := parseLogLine(ctx, podConfig, logPath)
-
-	found := false
-
-	for _, msg := range msgs {
-		if matched, _ := regexp.MatchString(pattern, msg.log); matched && msg.stream == stream {
-			found = true
-
-			break
-		}
-	}
-
-	Expect(found).To(BeTrue(), "expected log pattern %q (stream=%q) to match logs %+v", pattern, stream, msgs)
 }
 
 // listContainerStatsForID lists container for containerID.

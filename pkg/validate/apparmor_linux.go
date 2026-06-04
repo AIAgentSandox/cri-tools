@@ -97,10 +97,7 @@ var _ = framework.KubeDescribe("AppArmor", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
 		})
 
 		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
@@ -139,10 +136,7 @@ var _ = framework.KubeDescribe("AppArmor", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
 		})
 
 		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
@@ -190,10 +184,7 @@ var _ = framework.KubeDescribe("AppArmor", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, sandboxID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, sandboxID)
 		})
 
 		It("should fail with an unloaded apparmor_profile", func(ctx SpecContext) {
@@ -288,13 +279,16 @@ func loadTestProfiles(ctx context.Context) error {
 	defer os.Remove(f.Name())
 	defer f.Close()
 
-	// write test profiles to a temp file.
 	if _, err = f.WriteString(testProfiles); err != nil {
 		return fmt.Errorf("write profiles to file: %w", err)
 	}
 
-	// load apparmor profiles into kernel.
-	cmd := exec.CommandContext(ctx, "sudo", "apparmor_parser", "-r", "-W", f.Name())
+	binary, err := exec.LookPath("sudo")
+	if err != nil {
+		return fmt.Errorf("find sudo binary: %w", err)
+	}
+
+	cmd := exec.CommandContext(ctx, binary, "apparmor_parser", "-r", "-W", f.Name())
 	stderr := &bytes.Buffer{}
 	cmd.Stderr = stderr
 	out, err := cmd.Output()

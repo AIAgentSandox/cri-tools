@@ -17,10 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"time"
 
@@ -94,7 +95,7 @@ var statsCommand = &cli.Command{
 			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, err := getRuntimeService(c, 0)
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
@@ -118,20 +119,12 @@ var statsCommand = &cli.Command{
 			return err
 		}
 
-		if err = ContainerStats(runtimeClient, opts); err != nil {
+		if err = ContainerStats(c.Context, runtimeClient, opts); err != nil {
 			return fmt.Errorf("get container stats: %w", err)
 		}
 
 		return nil
 	},
-}
-
-type containerStatsByID []*pb.ContainerStats
-
-func (c containerStatsByID) Len() int      { return len(c) }
-func (c containerStatsByID) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
-func (c containerStatsByID) Less(i, j int) bool {
-	return c[i].GetAttributes().GetId() < c[j].GetAttributes().GetId()
 }
 
 type containerStatsDisplayer struct {
@@ -143,7 +136,7 @@ type containerStatsDisplayer struct {
 
 // ContainerStats sends a ListContainerStatsRequest to the server, and
 // parses the returned ListContainerStatsResponse.
-func ContainerStats(client internalapi.RuntimeService, opts *statsOptions) error {
+func ContainerStats(ctx context.Context, client internalapi.RuntimeService, opts *statsOptions) error {
 	d := containerStatsDisplayer{
 		opts: opts,
 		request: &pb.ListContainerStatsRequest{
@@ -156,7 +149,7 @@ func ContainerStats(client internalapi.RuntimeService, opts *statsOptions) error
 		display: newDefaultTableDisplay(),
 	}
 
-	return handleDisplay(context.TODO(), client, opts.watch, d.displayStats)
+	return handleDisplay(ctx, client, opts.watch, d.displayStats)
 }
 
 func (d containerStatsDisplayer) displayStats(ctx context.Context, client internalapi.RuntimeService) error {
@@ -251,7 +244,9 @@ func getContainerStats(ctx context.Context, client internalapi.RuntimeService, r
 		return nil, err
 	}
 
-	sort.Sort(containerStatsByID(r))
+	slices.SortFunc(r, func(a, b *pb.ContainerStats) int {
+		return cmp.Compare(a.GetAttributes().GetId(), b.GetAttributes().GetId())
+	})
 
 	return &pb.ListContainerStatsResponse{Stats: r}, nil
 }

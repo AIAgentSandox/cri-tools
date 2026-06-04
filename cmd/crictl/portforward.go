@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -67,7 +66,7 @@ var runtimePortForwardCommand = &cli.Command{
 			return cli.ShowSubcommandHelp(c)
 		}
 
-		runtimeClient, err := getRuntimeService(c, 0)
+		runtimeClient, err := configFromContext(c).GetRuntimeService(c.Context, 0)
 		if err != nil {
 			return err
 		}
@@ -94,7 +93,7 @@ var runtimePortForwardCommand = &cli.Command{
 // PortForward sends an PortForwardRequest to server, and parses the returned PortForwardResponse.
 func PortForward(ctx context.Context, client internalapi.RuntimeService, opts portforwardOptions) error {
 	if opts.id == "" {
-		return errors.New("ID cannot be empty")
+		return errIDEmpty
 	}
 
 	request := &pb.PortForwardRequest{

@@ -49,10 +49,7 @@ var _ = framework.KubeDescribe("Networking", func() {
 		var podID string
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		It("runtime should support DNS config [Conformance]", func(ctx SpecContext) {
@@ -245,18 +242,6 @@ func createWebServerContainer(ctx context.Context, rc internalapi.RuntimeService
 	containerConfig := &runtimeapi.ContainerConfig{
 		Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
 		Image:    &runtimeapi.ImageSpec{Image: webServerImage},
-		Linux:    &runtimeapi.LinuxContainerConfig{},
-	}
-
-	return framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
-}
-
-// createHostNetWebServerContainer creates a web server container using webServerHostNetContainerPort.
-func createHostNetWebServerContainer(ctx context.Context, rc internalapi.RuntimeService, ic internalapi.ImageManagerService, podID string, podConfig *runtimeapi.PodSandboxConfig, prefix string) string {
-	containerName := prefix + framework.NewUUID()
-	containerConfig := &runtimeapi.ContainerConfig{
-		Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
-		Image:    &runtimeapi.ImageSpec{Image: hostNetWebServerImage},
 		Linux:    &runtimeapi.LinuxContainerConfig{},
 	}
 

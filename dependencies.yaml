@@ -5,12 +5,20 @@ dependencies:
     refPaths:
       - path: README.md
         match: VERSION
+      - path: docs/benchmark.md
+        match: VERSION
+      - path: docs/crictl.md
+        match: VERSION
+      - path: docs/validation.md
+        match: VERSION
 
   - name: go
-    version: 1.26.2
+    version: 1.26.3
     refPaths:
       - path: go.mod
         match: go
+      - path: images/containerd-local-test/Dockerfile
+        match: GO_VERSION
 
   - name: zeitgeist
     version: v0.5.3
@@ -18,8 +26,14 @@ dependencies:
       - path: Makefile
         match: ZEITGEIST_VERSION
 
+  - name: zizmor
+    version: v1.25.2
+    refPaths:
+      - path: Makefile
+        match: ZIZMOR_VERSION
+
   - name: golangci-lint
-    version: v2.10.1
+    version: v2.12.2
     refPaths:
       - path: Makefile
         match: GOLANGCI_LINT_VERSION
@@ -30,11 +44,31 @@ dependencies:
       - path: Makefile
         match: REPO_INFRA_VERSION
 
+  - name: prettier
+    version: 3.8.3
+    refPaths:
+      - path: Makefile
+        match: PRETTIER_VERSION
+      - path: .github/workflows/build.yml
+        match: prettier_version
+
   - name: release-notes
     version: v0.18.0
     refPaths:
       - path: hack/release-notes.sh
         match: VERSION
+
+  - name: ubuntu
+    version: "24.04"
+    refPaths:
+      - path: .github/workflows/build.yml
+        match: ubuntu-
+      - path: .github/workflows/containerd.yml
+        match: ubuntu-
+      - path: .github/workflows/crio.yml
+        match: ubuntu-
+      - path: images/containerd-local-test/Dockerfile
+        match: ubuntu
 
   - name: busybox
     version: 1.37.0

@@ -65,10 +65,7 @@ var _ = framework.KubeDescribe("Security Context", func() {
 
 	AfterEach(func(ctx SpecContext) {
 		if podID != "" {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		}
 
 		if podLogDir != "" {
@@ -254,7 +251,7 @@ var _ = framework.KubeDescribe("Security Context", func() {
 		})
 
 		It("runtime should support HostNetwork is true", func(ctx SpecContext) {
-			srv, err := net.Listen("tcp", ":0")
+			srv, err := net.Listen("tcp", ":0") //nolint:gosec // G102: binding to all interfaces is intentional for host network validation
 			if err != nil {
 				framework.Failf("Failed to listen a tcp port: %v", err)
 			}
@@ -280,7 +277,7 @@ var _ = framework.KubeDescribe("Security Context", func() {
 		})
 
 		It("runtime should support HostNetwork is false", func(ctx SpecContext) {
-			srv, err := net.Listen("tcp", ":0")
+			srv, err := net.Listen("tcp", ":0") //nolint:gosec // G102: binding to all interfaces is intentional for host network validation
 			if err != nil {
 				framework.Failf("Failed to listen a tcp port: %v", err)
 			}
@@ -1553,7 +1550,7 @@ func createSeccompProfileDir() (string, error) {
 // createSeccompProfile creates a seccomp test profile with profileContents.
 func createSeccompProfile(profileContents, profileName, hostPath string) (string, error) {
 	profilePath := filepath.Join(hostPath, profileName)
-	if err := os.WriteFile(profilePath, []byte(profileContents), 0o644); err != nil {
+	if err := os.WriteFile(profilePath, []byte(profileContents), 0o600); err != nil {
 		return "", fmt.Errorf("create %s: %w", profilePath, err)
 	}
 

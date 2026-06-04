@@ -18,7 +18,6 @@ package validate
 
 import (
 	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	internalapi "k8s.io/cri-api/pkg/apis"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 
@@ -42,10 +41,7 @@ var _ = framework.KubeDescribe("Streaming", func() {
 		var podID string
 
 		AfterEach(func(ctx SpecContext) {
-			By("stop PodSandbox")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-			By("delete PodSandbox")
-			Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred())
+			framework.CleanupPodSandbox(ctx, rc, podID)
 		})
 
 		It("runtime should support portforward in host network", func(ctx SpecContext) {
@@ -73,7 +69,7 @@ var _ = framework.KubeDescribe("Streaming", func() {
 			req := createDefaultPortForward(ctx, rc, podID)
 
 			By("check the output of portforward")
-			checkPortForward(ctx, rc, req, webServerHostPortForHostNetPortFroward, webServerHostNetContainerPort)
+			checkPortForward(ctx, rc, req, webServerHostPortForHostNetPortForward, webServerHostNetContainerPort)
 		})
 	})
 })
