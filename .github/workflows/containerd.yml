@@ -32,7 +32,6 @@ jobs:
         os: [ubuntu-24.04, windows-2025]
         # not every command likes the slash in branch name.
         # So will use format command to replace to either `_` or '/'
-        # There is no LTS version of 2.0+ containerd. So main testing covers the latest.
         version: [main, "release{0}2.3", "release{0}1.7"]
         runtime:
           [
