@@ -17,6 +17,8 @@ dependencies:
     refPaths:
       - path: go.mod
         match: go
+      - path: hack/tools/go.mod
+        match: go
       - path: images/containerd-local-test/Dockerfile
         match: GO_VERSION
 
