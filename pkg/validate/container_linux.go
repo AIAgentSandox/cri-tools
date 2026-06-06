@@ -222,7 +222,7 @@ func createHostPathForMountPropagation(podID string, propagationOpt runtimeapi.M
 		err = unix.Unmount(mntSource, unix.MNT_DETACH)
 		framework.ExpectNoError(err, "failed to unmount \"mntSource\"")
 
-		os.RemoveAll(hostPath)
+		err = os.RemoveAll(hostPath)
 		framework.ExpectNoError(err, "failed to remove \"hostPath\"")
 	}
 
