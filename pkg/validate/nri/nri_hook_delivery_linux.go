@@ -70,82 +70,96 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 
-		It("should deliver StopPodSandbox hook to plugin even after slow RunPodSandbox hook", func(ctx SpecContext) {
-			// This test validates that even when a plugin's RunPodSandbox hook is slow
-			// (blocks for a period before returning success), the StopPodSandbox hook is
-			// still delivered to the plugin when the sandbox is later stopped. This ensures
-			// teardown hooks are reliable regardless of creation-path latency.
-			hookBlocking := make(chan struct{})
-			hookReached := make(chan struct{})
+		It(
+			"should deliver StopPodSandbox hook to plugin even after slow RunPodSandbox hook",
+			func(ctx SpecContext) {
+				// This test validates that even when a plugin's RunPodSandbox hook is slow
+				// (blocks for a period before returning success), the StopPodSandbox hook is
+				// still delivered to the plugin when the sandbox is later stopped. This ensures
+				// teardown hooks are reliable regardless of creation-path latency.
+				hookBlocking := make(chan struct{})
+				hookReached := make(chan struct{})
 
-			var err error
+				var err error
 
-			testStub, err = StartNRITestStub("cri-test-nri-stop-after-timeout", "00")
-			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+				testStub, err = StartNRITestStub("cri-test-nri-stop-after-timeout", "00")
+				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-			// Configure stub to simulate a slow RunPodSandbox (blocks for a while then returns)
-			testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
-				close(hookReached)
+				// Configure stub to simulate a slow RunPodSandbox (blocks for a while then returns)
+				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
+					close(hookReached)
 
-				select {
-				case <-hookBlocking:
-				case <-hookCtx.Done():
+					select {
+					case <-hookBlocking:
+					case <-hookCtx.Done():
+					}
+
+					return nil
 				}
 
-				return nil
-			}
+				By("triggering RunPodSandbox in a goroutine with slow plugin")
 
-			By("triggering RunPodSandbox in a goroutine with slow plugin")
+				podSandboxName := "nri-test-stop-after-timeout-" + framework.NewUUID()
+				uid := framework.DefaultUIDPrefix + framework.NewUUID()
+				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+				podConfig = &runtimeapi.PodSandboxConfig{
+					Metadata: framework.BuildPodSandboxMetadata(
+						podSandboxName,
+						uid,
+						namespace,
+						framework.DefaultAttempt,
+					),
+					Linux: &runtimeapi.LinuxPodSandboxConfig{
+						CgroupParent: common.GetCgroupParent(ctx, rc),
+					},
+					Labels: framework.DefaultPodLabels,
+				}
 
-			podSandboxName := "nri-test-stop-after-timeout-" + framework.NewUUID()
-			uid := framework.DefaultUIDPrefix + framework.NewUUID()
-			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-			podConfig = &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
-				Linux: &runtimeapi.LinuxPodSandboxConfig{
-					CgroupParent: common.GetCgroupParent(ctx, rc),
-				},
-				Labels: framework.DefaultPodLabels,
-			}
+				var (
+					runErr   error
+					runPodID string
+					runWg    sync.WaitGroup
+				)
 
-			var (
-				runErr   error
-				runPodID string
-				runWg    sync.WaitGroup
-			)
+				runWg.Go(func() {
+					runPodID, runErr = rc.RunPodSandbox(
+						ctx,
+						podConfig,
+						framework.TestContext.RuntimeHandler,
+					)
+				})
 
-			runWg.Go(func() {
-				runPodID, runErr = rc.RunPodSandbox(ctx, podConfig, framework.TestContext.RuntimeHandler)
-			})
+				By("waiting for RunPodSandbox hook to fire")
 
-			By("waiting for RunPodSandbox hook to fire")
+				select {
+				case <-hookReached:
+					// Hook is blocking (simulating slow plugin)
+				case <-time.After(30 * time.Second):
+					close(hookBlocking)
+					Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
+				}
 
-			select {
-			case <-hookReached:
-				// Hook is blocking (simulating slow plugin)
-			case <-time.After(30 * time.Second):
+				By("releasing the slow hook so RunPodSandbox completes")
 				close(hookBlocking)
-				Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
-			}
+				runWg.Wait()
+				Expect(
+					runErr,
+				).NotTo(HaveOccurred(), "RunPodSandbox should succeed after slow hook returns")
+				Expect(runPodID).NotTo(BeEmpty())
+				podID = runPodID
 
-			By("releasing the slow hook so RunPodSandbox completes")
-			close(hookBlocking)
-			runWg.Wait()
-			Expect(runErr).NotTo(HaveOccurred(), "RunPodSandbox should succeed after slow hook returns")
-			Expect(runPodID).NotTo(BeEmpty())
-			podID = runPodID
+				// Reset events to only capture StopPodSandbox from here
+				testStub.Plugin.Reset()
 
-			// Reset events to only capture StopPodSandbox from here
-			testStub.Plugin.Reset()
+				By("stopping the sandbox and verifying StopPodSandbox hook is delivered")
+				Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
 
-			By("stopping the sandbox and verifying StopPodSandbox hook is delivered")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
-
-			stopEvent, err := testStub.Plugin.WaitForEvent(EventStopPodSandbox, 10*time.Second)
-			Expect(err).NotTo(HaveOccurred(),
-				"StopPodSandbox NRI hook MUST be delivered even after RunPodSandbox was slow/delayed")
-			Expect(stopEvent.PodSandboxID).To(Equal(podID))
-		})
+				stopEvent, err := testStub.Plugin.WaitForEvent(EventStopPodSandbox, 10*time.Second)
+				Expect(err).NotTo(HaveOccurred(),
+					"StopPodSandbox NRI hook MUST be delivered even after RunPodSandbox was slow/delayed")
+				Expect(stopEvent.PodSandboxID).To(Equal(podID))
+			},
+		)
 
 		It("should not invoke NRI hooks for invalid CRI requests", func(ctx SpecContext) {
 			// This test validates that invalid CRI requests (bad arguments, non-existing sandbox)
@@ -161,16 +175,28 @@ var _ = framework.KubeDescribe("NRI", func() {
 			containerName := "nri-test-invalid-ctr-" + framework.NewUUID()
 			containerConfig := &runtimeapi.ContainerConfig{
 				Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
-				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
-				Command:  framework.DefaultPauseCommand,
-				Linux:    &runtimeapi.LinuxContainerConfig{},
+				Image: &runtimeapi.ImageSpec{
+					Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
+				},
+				Command: framework.DefaultPauseCommand,
+				Linux:   &runtimeapi.LinuxContainerConfig{},
 			}
 
 			bogusConfig := &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata("bogus", "bogus-uid", "bogus-ns", framework.DefaultAttempt),
+				Metadata: framework.BuildPodSandboxMetadata(
+					"bogus",
+					"bogus-uid",
+					"bogus-ns",
+					framework.DefaultAttempt,
+				),
 			}
 
-			_, createErr := rc.CreateContainer(ctx, "non-existing-sandbox-id-12345", containerConfig, bogusConfig)
+			_, createErr := rc.CreateContainer(
+				ctx,
+				"non-existing-sandbox-id-12345",
+				containerConfig,
+				bogusConfig,
+			)
 			Expect(createErr).To(HaveOccurred(),
 				"CreateContainer for a non-existing sandbox should fail")
 

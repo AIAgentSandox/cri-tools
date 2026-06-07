@@ -269,7 +269,10 @@ func (p *NRITestPlugin) Reset() {
 }
 
 // WaitForEvent waits until an event of the given type is recorded, or times out.
-func (p *NRITestPlugin) WaitForEvent(eventType NRIEventType, timeout time.Duration) (*NRIEvent, error) {
+func (p *NRITestPlugin) WaitForEvent(
+	eventType NRIEventType,
+	timeout time.Duration,
+) (*NRIEvent, error) {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
