@@ -251,13 +251,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			By("waiting for the container lifecycle NRI events")
 			// RemoveContainer is the terminal, mandatory event for the container
-			// lifecycle. NRI hooks are delivered in invocation order, so once the
-			// RemoveContainer event is recorded every earlier event for the container
-			// (including the optional StopContainer the runtime may emit on natural
-			// exit) is already present. Poll for the terminal event rather than a raw
-			// event count, which would otherwise race the asynchronous event delivery
-			// and the optional StopContainer event (e.g. returning on
-			// {Create, Start, Stop} before RemoveContainer lands).
+			// lifecycle. The Create, Start and Remove hooks are invoked synchronously
+			// by the runtime in response to the CRI calls this test makes, so once the
+			// RemoveContainer event is recorded those earlier events are guaranteed to
+			// be present already. Poll for the terminal event rather than a raw event
+			// count, which would otherwise race the asynchronous event delivery. The
+			// StopContainer hook for a self-exited container is delivered
+			// asynchronously by the runtime and may arrive before, after, or never
+			// relative to RemoveContainer; it is therefore treated as optional below.
 			var containerEvents []NRIEvent
 
 			Eventually(func() bool {
@@ -265,14 +266,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 				removeSeen := false
 
 				for _, e := range testStub.Plugin.Events() {
-					// Filter for container events (those with a ContainerID set).
-					if e.ContainerID == "" {
+					// Only consider events for the container under test.
+					if e.ContainerID != containerID {
 						continue
 					}
 
 					containerEvents = append(containerEvents, e)
 
-					if e.Type == EventRemoveContainer && e.ContainerID == containerID {
+					if e.Type == EventRemoveContainer {
 						removeSeen = true
 					}
 				}
@@ -283,16 +284,26 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			var createEvent, startEvent, stopEvent, removeEvent *NRIEvent
 
+			// Capture the first occurrence of each event type so the ordering
+			// assertions are not skewed by any duplicate hook a runtime might emit.
 			for i := range containerEvents {
 				switch containerEvents[i].Type {
 				case EventCreateContainer:
-					createEvent = &containerEvents[i]
+					if createEvent == nil {
+						createEvent = &containerEvents[i]
+					}
 				case EventStartContainer:
-					startEvent = &containerEvents[i]
+					if startEvent == nil {
+						startEvent = &containerEvents[i]
+					}
 				case EventStopContainer:
-					stopEvent = &containerEvents[i]
+					if stopEvent == nil {
+						stopEvent = &containerEvents[i]
+					}
 				case EventRemoveContainer:
-					removeEvent = &containerEvents[i]
+					if removeEvent == nil {
+						removeEvent = &containerEvents[i]
+					}
 				case EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox:
 					// Pod events are not verified in this test.
 				}
