@@ -208,6 +208,28 @@ It("should not fail on simultaneous RemoveImage calls [Conformance]", Serial, fu
 })
 ```
 
+#### Handling spec discrepancies
+
+When a contract test exercises behavior that a runtime under test is known to
+implement differently from the CRI spec, skip the affected assertion rather than
+failing the suite. Mark the deviation with a `SPEC_DISCREPANCY:` comment and call
+`Skip(...)` with a short explanation, so known gaps stay greppable and don't
+break CI:
+
+```go
+ctrID, createErr := rc.CreateContainer(ctx, podID, containerConfig, podConfig)
+if createErr == nil {
+    // SPEC_DISCREPANCY: containerd allows CreateContainer on a stopped sandbox
+    // instead of rejecting it.
+    containerID = ctrID // let AfterEach clean it up
+
+    Skip("spec discrepancy: containerd allows CreateContainer on a stopped sandbox; " +
+        "spec says sandbox should never be reused after Stop")
+}
+
+Expect(createErr).To(HaveOccurred(), "...")
+```
+
 ## CI/CD
 
 The project's CI/CD pipeline is defined in the `.github/workflows` directory. The `containerd.yml` file defines the workflow for running tests against `containerd`.
