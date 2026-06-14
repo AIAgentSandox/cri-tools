@@ -201,7 +201,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 
-		It("should receive CreateContainer, StartContainer, StopContainer, and RemoveContainer for a container that exits with a non-zero code", func(ctx SpecContext) {
+		It("should receive CreateContainer, StartContainer, and RemoveContainer (and StopContainer when the runtime delivers it) for a container that exits with a non-zero code", func(ctx SpecContext) {
 			By("creating a pod sandbox")
 
 			podSandboxName := "nri-test-ctr-fail-" + framework.NewUUID()
@@ -243,27 +243,43 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}, time.Minute, time.Second*2).Should(Equal(runtimeapi.ContainerState_CONTAINER_EXITED))
 
 			status := getContainerStatus(ctx, rc, containerID)
-			Expect(status.GetExitCode()).NotTo(BeEquivalentTo(0),
-				"container should have failed with a non-zero exit code")
+			Expect(status.GetExitCode()).To(BeEquivalentTo(1),
+				`container should have failed with exit code 1 (from sh -c "exit 1")`)
 
 			By("removing the failed container")
 			Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred())
 
 			By("waiting for the container lifecycle NRI events")
-			// At least Create, Start, and Remove are expected; StopContainer is also
-			// expected when the runtime delivers a stop notification for the exited
-			// container. Wait for at least 3 to avoid racing the (optional) stop event.
-			events, err := testStub.Plugin.WaitForEventCount(3, 10*time.Second)
-			Expect(err).NotTo(HaveOccurred(), "NRI stub did not receive container lifecycle events")
-
-			// Filter for container events (those with a ContainerID set)
+			// RemoveContainer is the terminal, mandatory event for the container
+			// lifecycle. NRI hooks are delivered in invocation order, so once the
+			// RemoveContainer event is recorded every earlier event for the container
+			// (including the optional StopContainer the runtime may emit on natural
+			// exit) is already present. Poll for the terminal event rather than a raw
+			// event count, which would otherwise race the asynchronous event delivery
+			// and the optional StopContainer event (e.g. returning on
+			// {Create, Start, Stop} before RemoveContainer lands).
 			var containerEvents []NRIEvent
 
-			for i := range events {
-				if events[i].ContainerID != "" {
-					containerEvents = append(containerEvents, events[i])
+			Eventually(func() bool {
+				containerEvents = nil
+				removeSeen := false
+
+				for _, e := range testStub.Plugin.Events() {
+					// Filter for container events (those with a ContainerID set).
+					if e.ContainerID == "" {
+						continue
+					}
+
+					containerEvents = append(containerEvents, e)
+
+					if e.Type == EventRemoveContainer && e.ContainerID == containerID {
+						removeSeen = true
+					}
 				}
-			}
+
+				return removeSeen
+			}, 10*time.Second, 50*time.Millisecond).Should(BeTrue(),
+				"NRI stub did not receive the RemoveContainer event for container %s", containerID)
 
 			var createEvent, startEvent, stopEvent, removeEvent *NRIEvent
 
