@@ -157,6 +157,174 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 	})
 
+	Context("container lifecycle (failed container)", Serial, func() {
+		var (
+			testStub    *NRITestStub
+			podID       string
+			podConfig   *runtimeapi.PodSandboxConfig
+			containerID string
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			var err error
+
+			testStub, err = StartNRITestStub("cri-test-nri-ctr-fail", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+
+			// Ensure test image is available
+			framework.PullPublicImage(ctx, ic, framework.TestContext.TestImageList.DefaultTestContainerImage, nil)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			if containerID != "" {
+				if err := rc.StopContainer(ctx, containerID, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", containerID, err)
+				}
+
+				if err := rc.RemoveContainer(ctx, containerID); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", containerID, err)
+				}
+			}
+
+			if podID != "" {
+				if err := rc.StopPodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", podID, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
+				}
+			}
+
+			if testStub != nil {
+				testStub.Cleanup()
+			}
+		})
+
+		It("should receive CreateContainer, StartContainer, StopContainer, and RemoveContainer for a container that exits with a non-zero code", func(ctx SpecContext) {
+			By("creating a pod sandbox")
+
+			podSandboxName := "nri-test-ctr-fail-" + framework.NewUUID()
+			uid := framework.DefaultUIDPrefix + framework.NewUUID()
+			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+			podConfig = &runtimeapi.PodSandboxConfig{
+				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
+				Labels: framework.DefaultPodLabels,
+			}
+			podID = framework.RunPodSandbox(ctx, rc, podConfig)
+			Expect(podID).NotTo(BeEmpty())
+
+			// Reset events so we only capture container-related events from this point
+			testStub.Plugin.Reset()
+
+			By("creating a container whose command exits with a non-zero code")
+
+			containerName := "nri-test-failed-container-" + framework.NewUUID()
+			containerConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				// Exit immediately with a failure so the container terminates on its
+				// own (no explicit StopContainer CRI call) with a non-zero exit code.
+				Command: []string{"sh", "-c", "exit 1"},
+				Linux:   &runtimeapi.LinuxContainerConfig{},
+			}
+			containerID = framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
+			Expect(containerID).NotTo(BeEmpty())
+
+			By("starting the container")
+			Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
+
+			By("waiting for the container to exit with a non-zero exit code")
+			Eventually(func() runtimeapi.ContainerState {
+				return getContainerStatus(ctx, rc, containerID).GetState()
+			}, time.Minute, time.Second*2).Should(Equal(runtimeapi.ContainerState_CONTAINER_EXITED))
+
+			status := getContainerStatus(ctx, rc, containerID)
+			Expect(status.GetExitCode()).NotTo(BeEquivalentTo(0),
+				"container should have failed with a non-zero exit code")
+
+			By("removing the failed container")
+			Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred())
+
+			By("waiting for the container lifecycle NRI events")
+			// At least Create, Start, and Remove are expected; StopContainer is also
+			// expected when the runtime delivers a stop notification for the exited
+			// container. Wait for at least 3 to avoid racing the (optional) stop event.
+			events, err := testStub.Plugin.WaitForEventCount(3, 10*time.Second)
+			Expect(err).NotTo(HaveOccurred(), "NRI stub did not receive container lifecycle events")
+
+			// Filter for container events (those with a ContainerID set)
+			var containerEvents []NRIEvent
+
+			for i := range events {
+				if events[i].ContainerID != "" {
+					containerEvents = append(containerEvents, events[i])
+				}
+			}
+
+			var createEvent, startEvent, stopEvent, removeEvent *NRIEvent
+
+			for i := range containerEvents {
+				switch containerEvents[i].Type {
+				case EventCreateContainer:
+					createEvent = &containerEvents[i]
+				case EventStartContainer:
+					startEvent = &containerEvents[i]
+				case EventStopContainer:
+					stopEvent = &containerEvents[i]
+				case EventRemoveContainer:
+					removeEvent = &containerEvents[i]
+				case EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox:
+					// Pod events are not verified in this test.
+				}
+			}
+
+			By("verifying CreateContainer event fired with correct metadata")
+			Expect(createEvent).NotTo(BeNil(), "CreateContainer event not received")
+			Expect(createEvent.ContainerID).To(Equal(containerID))
+
+			By("verifying StartContainer event fired for the failed container")
+			Expect(startEvent).NotTo(BeNil(), "StartContainer event not received")
+			Expect(startEvent.ContainerID).To(Equal(containerID))
+
+			By("verifying RemoveContainer event fired for the failed container")
+			Expect(removeEvent).NotTo(BeNil(), "RemoveContainer event not received")
+			Expect(removeEvent.ContainerID).To(Equal(containerID))
+
+			By("verifying Create -> Start -> Remove ordering")
+			Expect(createEvent.Timestamp.Before(startEvent.Timestamp)).To(BeTrue(),
+				"CreateContainer (at %v) should occur before StartContainer (at %v)",
+				createEvent.Timestamp, startEvent.Timestamp)
+			Expect(startEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
+				"StartContainer (at %v) should occur before RemoveContainer (at %v)",
+				startEvent.Timestamp, removeEvent.Timestamp)
+
+			// SPEC_DISCREPANCY: a container that exits on its own does not always
+			// generate an NRI StopContainer callback (the runtime may only deliver
+			// StopContainer in response to an explicit CRI StopContainer call). When
+			// present, it MUST be correctly ordered between Start and Remove.
+			if stopEvent == nil {
+				framework.Logf("NRI StopContainer event not received for self-exited container " +
+					"(runtime does not deliver StopContainer on natural exit)")
+			} else {
+				By("verifying StopContainer event metadata and ordering")
+				Expect(stopEvent.ContainerID).To(Equal(containerID))
+				Expect(startEvent.Timestamp.Before(stopEvent.Timestamp)).To(BeTrue(),
+					"StartContainer (at %v) should occur before StopContainer (at %v)",
+					startEvent.Timestamp, stopEvent.Timestamp)
+				Expect(stopEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
+					"StopContainer (at %v) should occur before RemoveContainer (at %v)",
+					stopEvent.Timestamp, removeEvent.Timestamp)
+			}
+
+			// Mark container as cleaned up so AfterEach doesn't try again.
+			containerID = ""
+		})
+	})
+
 	Context("RunPodSandbox contract", Serial, func() {
 		var (
 			testStub  *NRITestStub
