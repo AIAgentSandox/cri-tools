@@ -605,14 +605,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred(),
 				"First StopPodSandbox call should succeed")
 
-			By("calling StopPodSandbox again (idempotency check)")
-			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred(),
-				"Second StopPodSandbox call MUST succeed (idempotent)")
-
-			By("verifying the StopPodSandbox NRI hook fired")
-			// The stub records every StopPodSandbox invocation, so wait for the
-			// RunPodSandbox + StopPodSandbox events instead of sleeping a fixed
-			// duration (matches the lifecycle test above and avoids flakiness).
+			By("verifying the StopPodSandbox NRI hook fired exactly once")
+			// Wait for RunPodSandbox + StopPodSandbox events from the first call.
 			events, err := testStub.Plugin.WaitForEventCount(2, 10*time.Second)
 			Expect(err).NotTo(HaveOccurred(), "NRI stub did not receive the StopPodSandbox event")
 
@@ -624,8 +618,28 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 			}
 
-			Expect(stopEvents).To(BeNumerically(">=", 1),
-				"StopPodSandbox NRI hook should fire at least once")
+			Expect(stopEvents).To(Equal(1),
+				"StopPodSandbox NRI hook should fire exactly once for the first call")
+
+			By("calling StopPodSandbox again (idempotency check)")
+			Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred(),
+				"Second StopPodSandbox call MUST succeed (idempotent)")
+
+			By("verifying the second StopPodSandbox does NOT generate an NRI event")
+			// Give the runtime a moment to deliver any spurious event.
+			time.Sleep(2 * time.Second)
+
+			allEvents := testStub.Plugin.Events()
+			stopEventsAfter := 0
+
+			for _, e := range FilterEventsByPodID(allEvents, podID) {
+				if e.Type == EventStopPodSandbox {
+					stopEventsAfter++
+				}
+			}
+
+			Expect(stopEventsAfter).To(Equal(1),
+				"Second StopPodSandbox MUST NOT generate an NRI event — sandbox is already stopped")
 
 			By("verifying sandbox cannot be reused - CreateContainer should fail after Stop")
 			framework.PullPublicImage(ctx, ic, framework.TestContext.TestImageList.DefaultTestContainerImage, nil)
@@ -656,6 +670,21 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			Expect(createErr).To(HaveOccurred(),
 				"CreateContainer on a stopped sandbox MUST return an error (sandbox never reused after Stop)")
+
+			By("verifying the failed CreateContainer did NOT generate an NRI event")
+			time.Sleep(2 * time.Second)
+
+			allEventsAfterCreate := testStub.Plugin.Events()
+			containerEvents := 0
+
+			for _, e := range FilterEventsByPodID(allEventsAfterCreate, podID) {
+				if e.Type == EventCreateContainer {
+					containerEvents++
+				}
+			}
+
+			Expect(containerEvents).To(Equal(0),
+				"Failed CreateContainer on a stopped sandbox MUST NOT generate an NRI CreateContainer event")
 		})
 	})
 })
