@@ -246,106 +246,91 @@ var _ = framework.KubeDescribe("NRI", func() {
 			Expect(status.GetExitCode()).To(BeEquivalentTo(1),
 				`container should have failed with exit code 1 (from sh -c "exit 1")`)
 
-			By("removing the failed container")
-			Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred())
-
-			By("waiting for the container lifecycle NRI events")
-			// RemoveContainer is the terminal, mandatory event for the container
-			// lifecycle. The Create, Start and Remove hooks are invoked synchronously
-			// by the runtime in response to the CRI calls this test makes, so once the
-			// RemoveContainer event is recorded those earlier events are guaranteed to
-			// be present already. Poll for the terminal event rather than a raw event
-			// count, which would otherwise race the asynchronous event delivery. The
-			// StopContainer hook for a self-exited container is delivered
-			// asynchronously by the runtime and may arrive before, after, or never
-			// relative to RemoveContainer; it is therefore treated as optional below.
+			By("waiting for Create, Start, and Stop NRI events before removing the container")
+			// The runtime must deliver StopContainer on its own for a
+			// self-exited container, without an explicit CRI RemoveContainer
+			// call. Wait for all three events before calling RemoveContainer
+			// to prove that StopContainer is not a side effect of removal.
 			var containerEvents []NRIEvent
+
+			var createEvent, startEvent, stopEvent *NRIEvent
 
 			Eventually(func() bool {
 				containerEvents = nil
-				removeSeen := false
+				createEvent, startEvent, stopEvent = nil, nil, nil
 
 				for _, e := range testStub.Plugin.Events() {
-					// Only consider events for the container under test.
 					if e.ContainerID != containerID {
 						continue
 					}
 
 					containerEvents = append(containerEvents, e)
 
-					if e.Type == EventRemoveContainer {
-						removeSeen = true
+					switch e.Type {
+					case EventCreateContainer:
+						if createEvent == nil {
+							createEvent = &e
+						}
+					case EventStartContainer:
+						if startEvent == nil {
+							startEvent = &e
+						}
+					case EventStopContainer:
+						if stopEvent == nil {
+							stopEvent = &e
+						}
+					case EventRemoveContainer:
+						// Verified separately after calling RemoveContainer.
+					case EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox:
+						// Pod events are not verified in this test.
 					}
 				}
 
-				return removeSeen
+				return createEvent != nil && startEvent != nil && stopEvent != nil
 			}, 10*time.Second, 50*time.Millisecond).Should(BeTrue(),
-				"NRI stub did not receive the RemoveContainer event for container %s", containerID)
-
-			var createEvent, startEvent, stopEvent, removeEvent *NRIEvent
-
-			// Capture the first occurrence of each event type so the ordering
-			// assertions are not skewed by any duplicate hook a runtime might emit.
-			for i := range containerEvents {
-				switch containerEvents[i].Type {
-				case EventCreateContainer:
-					if createEvent == nil {
-						createEvent = &containerEvents[i]
-					}
-				case EventStartContainer:
-					if startEvent == nil {
-						startEvent = &containerEvents[i]
-					}
-				case EventStopContainer:
-					if stopEvent == nil {
-						stopEvent = &containerEvents[i]
-					}
-				case EventRemoveContainer:
-					if removeEvent == nil {
-						removeEvent = &containerEvents[i]
-					}
-				case EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox:
-					// Pod events are not verified in this test.
-				}
-			}
+				"NRI stub did not receive Create, Start, and Stop events for container %s before removal", containerID)
 
 			By("verifying CreateContainer event fired with correct metadata")
-			Expect(createEvent).NotTo(BeNil(), "CreateContainer event not received")
 			Expect(createEvent.ContainerID).To(Equal(containerID))
 
 			By("verifying StartContainer event fired for the failed container")
-			Expect(startEvent).NotTo(BeNil(), "StartContainer event not received")
 			Expect(startEvent.ContainerID).To(Equal(containerID))
 
-			By("verifying RemoveContainer event fired for the failed container")
-			Expect(removeEvent).NotTo(BeNil(), "RemoveContainer event not received")
-			Expect(removeEvent.ContainerID).To(Equal(containerID))
+			By("verifying StopContainer event fired without explicit removal")
+			Expect(stopEvent.ContainerID).To(Equal(containerID))
 
-			By("verifying Create -> Start -> Remove ordering")
+			By("verifying Create -> Start -> Stop ordering")
 			Expect(createEvent.Timestamp.Before(startEvent.Timestamp)).To(BeTrue(),
 				"CreateContainer (at %v) should occur before StartContainer (at %v)",
 				createEvent.Timestamp, startEvent.Timestamp)
-			Expect(startEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
-				"StartContainer (at %v) should occur before RemoveContainer (at %v)",
-				startEvent.Timestamp, removeEvent.Timestamp)
+			Expect(startEvent.Timestamp.Before(stopEvent.Timestamp)).To(BeTrue(),
+				"StartContainer (at %v) should occur before StopContainer (at %v)",
+				startEvent.Timestamp, stopEvent.Timestamp)
 
-			// SPEC_DISCREPANCY: a container that exits on its own does not always
-			// generate an NRI StopContainer callback (the runtime may only deliver
-			// StopContainer in response to an explicit CRI StopContainer call). When
-			// present, it MUST be correctly ordered between Start and Remove.
-			if stopEvent == nil {
-				framework.Logf("NRI StopContainer event not received for self-exited container " +
-					"(runtime does not deliver StopContainer on natural exit)")
-			} else {
-				By("verifying StopContainer event metadata and ordering")
-				Expect(stopEvent.ContainerID).To(Equal(containerID))
-				Expect(startEvent.Timestamp.Before(stopEvent.Timestamp)).To(BeTrue(),
-					"StartContainer (at %v) should occur before StopContainer (at %v)",
-					startEvent.Timestamp, stopEvent.Timestamp)
-				Expect(stopEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
-					"StopContainer (at %v) should occur before RemoveContainer (at %v)",
-					stopEvent.Timestamp, removeEvent.Timestamp)
-			}
+			By("removing the failed container")
+			Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred())
+
+			By("waiting for RemoveContainer NRI event")
+
+			var removeEvent *NRIEvent
+
+			Eventually(func() bool {
+				for _, e := range testStub.Plugin.Events() {
+					if e.ContainerID == containerID && e.Type == EventRemoveContainer {
+						removeEvent = &e
+
+						return true
+					}
+				}
+
+				return false
+			}, 10*time.Second, 50*time.Millisecond).Should(BeTrue(),
+				"NRI stub did not receive the RemoveContainer event for container %s", containerID)
+
+			By("verifying Stop -> Remove ordering")
+			Expect(stopEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
+				"StopContainer (at %v) should occur before RemoveContainer (at %v)",
+				stopEvent.Timestamp, removeEvent.Timestamp)
 
 			// Mark container as cleaned up so AfterEach doesn't try again.
 			containerID = ""
