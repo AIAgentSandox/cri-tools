@@ -286,10 +286,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"NRI stub did not receive Create, Start, and Stop events for container %s before removal", containerID)
 
 			By("verifying CreateContainer event fired with correct metadata")
-			// SPEC_DISCREPANCY: CRI-O does not populate container name in NRI
-			// CreateContainer event metadata.
+			// SPEC_DISCREPANCY: CRI-O does not populate container name in NRI CreateContainer
+			// event metadata. Record it here and skip at the very end so the remaining
+			// assertions (ContainerID, Start/Stop/Remove, ordering) still run.
+			skipForMissingName := false
 			if createEvent.ContainerName == "" {
-				Skip("spec discrepancy: runtime does not populate container name in NRI CreateContainer event metadata")
+				skipForMissingName = true
+			} else {
+				Expect(createEvent.ContainerName).To(Equal(containerName))
 			}
 
 			Expect(createEvent.ContainerName).To(Equal(containerName))
@@ -328,6 +332,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}, 10*time.Second, 50*time.Millisecond).Should(BeTrue(),
 				"NRI stub did not receive the RemoveContainer event for container %s", containerID)
 
+			By("verifying RemoveContainer event has correct container ID")
+			Expect(removeEvent.ContainerName).To(Equal(containerName))
+
 			By("verifying Stop -> Remove ordering")
 			Expect(stopEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
 				"StopContainer (at %v) should occur before RemoveContainer (at %v)",
@@ -335,6 +342,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			// Mark container as cleaned up so AfterEach doesn't try again.
 			containerID = ""
+
+			if skipForMissingName {
+				Skip("spec discrepancy: runtime does not populate container name in NRI CreateContainer event metadata")
+			}
 		})
 	})
 
