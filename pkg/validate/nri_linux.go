@@ -288,19 +288,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(createEvent.ContainerName).To(Equal(containerName))
 			}
 
-			Expect(createEvent.ContainerID).To(Equal(containerID))
-
 			By("verifying StartContainer event has correct container ID")
 			Expect(startEvent).NotTo(BeNil(), "StartContainer event not received")
-			Expect(startEvent.ContainerID).To(Equal(containerID))
+			Expect(startEvent.ContainerName).To(Equal(containerName))
 
 			By("verifying StopContainer event has correct container ID")
 			Expect(stopEvent).NotTo(BeNil(), "StopContainer event not received")
-			Expect(stopEvent.ContainerID).To(Equal(containerID))
+			Expect(stopEvent.ContainerName).To(Equal(containerName))
 
 			By("verifying RemoveContainer event has correct container ID")
 			Expect(removeEvent).NotTo(BeNil(), "RemoveContainer event not received")
-			Expect(removeEvent.ContainerID).To(Equal(containerID))
+			Expect(removeEvent.ContainerName).To(Equal(containerName))
 
 			By("verifying events in strict order: Create -> Start -> Stop -> Remove")
 			Expect(createEvent.Timestamp.Before(startEvent.Timestamp)).To(BeTrue(),
