@@ -272,18 +272,22 @@ var _ = framework.KubeDescribe("NRI", func() {
 					stopEvent = &containerEvents[i]
 				case EventRemoveContainer:
 					removeEvent = &containerEvents[i]
-				case EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox:
-					// Pod events not verified in this test. Events are expected, but test ignores them
+				default:
+					Fail(fmt.Sprintf("unexpected event %v in container lifecycle test", containerEvents[i].Type))
 				}
 			}
 
 			Expect(createEvent).NotTo(BeNil(), "CreateContainer event not received")
-			// SPEC_DISCREPANCY: CRI-O does not populate container name in NRI CreateContainer event metadata
+			// SPEC_DISCREPANCY: CRI-O does not populate container name in NRI CreateContainer
+			// event metadata. Record it here and skip at the very end so the remaining
+			// assertions (ContainerID, Start/Stop/Remove, ordering) still run.
+			skipForMissingName := false
 			if createEvent.ContainerName == "" {
-				Skip("spec discrepancy: runtime does not populate container name in NRI CreateContainer event metadata")
+				skipForMissingName = true
+			} else {
+				Expect(createEvent.ContainerName).To(Equal(containerName))
 			}
 
-			Expect(createEvent.ContainerName).To(Equal(containerName))
 			Expect(createEvent.ContainerID).To(Equal(containerID))
 
 			By("verifying StartContainer event has correct container ID")
@@ -311,6 +315,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			// Mark container as cleaned up
 			containerID = ""
+
+			if skipForMissingName {
+				Skip("spec discrepancy: runtime does not populate container name in NRI CreateContainer event metadata")
+			}
 		})
 	})
 
