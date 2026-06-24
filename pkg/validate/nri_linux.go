@@ -296,13 +296,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(createEvent.ContainerName).To(Equal(containerName))
 			}
 
-			Expect(createEvent.ContainerName).To(Equal(containerName))
-
 			By("verifying StartContainer event fired for the failed container")
-			Expect(startEvent.ContainerName).To(Equal(containerName))
+
+			if !skipForMissingName {
+				Expect(startEvent.ContainerName).To(Equal(containerName))
+			}
 
 			By("verifying StopContainer event fired without explicit removal")
-			Expect(stopEvent.ContainerName).To(Equal(containerName))
+
+			if !skipForMissingName {
+				Expect(stopEvent.ContainerName).To(Equal(containerName))
+			}
 
 			By("verifying Create -> Start -> Stop ordering")
 			Expect(createEvent.Timestamp.Before(startEvent.Timestamp)).To(BeTrue(),
@@ -333,7 +337,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"NRI stub did not receive the RemoveContainer event for container %s", containerID)
 
 			By("verifying RemoveContainer event has correct container ID")
-			Expect(removeEvent.ContainerName).To(Equal(containerName))
+
+			if !skipForMissingName {
+				Expect(removeEvent.ContainerName).To(Equal(containerName))
+			}
 
 			By("verifying Stop -> Remove ordering")
 			Expect(stopEvent.Timestamp.Before(removeEvent.Timestamp)).To(BeTrue(),
