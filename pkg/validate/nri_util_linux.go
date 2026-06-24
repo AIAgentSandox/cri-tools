@@ -226,29 +226,6 @@ func (p *NRITestPlugin) WaitForEventCount(count int, timeout time.Duration) ([]N
 	return nil, fmt.Errorf("timed out waiting for %d NRI events after %v (got %d)", count, timeout, len(p.events))
 }
 
-// WaitForPodEvent polls recorded events until at least one event of the given
-// type for the specified pod is observed, or the timeout elapses. It returns
-// all events recorded for that pod once the matching event appears. Unlike
-// WaitForEventCount, it does not assume a fixed total number of events, so it
-// is robust to additional lifecycle events emitted by future runtime/NRI
-// versions.
-func (p *NRITestPlugin) WaitForPodEvent(podID string, eventType NRIEventType, timeout time.Duration) ([]NRIEvent, error) {
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		podEvents := FilterEventsByPodID(p.Events(), podID)
-		for i := range podEvents {
-			if podEvents[i].Type == eventType {
-				return podEvents, nil
-			}
-		}
-
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	return nil, fmt.Errorf("timed out waiting for %v event for pod %s after %v", eventType, podID, timeout)
-}
-
 // FilterEventsByPodID returns events matching a specific pod sandbox ID.
 func FilterEventsByPodID(events []NRIEvent, podID string) []NRIEvent {
 	var filtered []NRIEvent

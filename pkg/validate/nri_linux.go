@@ -606,22 +606,24 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"First StopPodSandbox call should succeed")
 
 			By("verifying the StopPodSandbox NRI hook fired exactly once")
-			// Poll this pod's events until the StopPodSandbox event arrives,
-			// rather than assuming a global count of exactly two events (which
-			// would break if a future runtime/NRI version emits additional
-			// lifecycle events).
-			events, err := testStub.Plugin.WaitForPodEvent(podID, EventStopPodSandbox, 10*time.Second)
-			Expect(err).NotTo(HaveOccurred(), "NRI stub did not receive the StopPodSandbox event")
+			// Poll for the StopPodSandbox event rather than assuming a fixed
+			// global event count, which would break if a future runtime/NRI
+			// version emits additional lifecycle events.
+			var stopPodSandboxEvents []NRIEvent
 
-			stopEvents := 0
+			Eventually(func() []NRIEvent {
+				stopPodSandboxEvents = nil
 
-			for _, e := range events {
-				if e.Type == EventStopPodSandbox {
-					stopEvents++
+				for _, e := range FilterEventsByPodID(testStub.Plugin.Events(), podID) {
+					if e.Type == EventStopPodSandbox {
+						stopPodSandboxEvents = append(stopPodSandboxEvents, e)
+					}
 				}
-			}
 
-			Expect(stopEvents).To(Equal(1),
+				return stopPodSandboxEvents
+			}, 10*time.Second, 50*time.Millisecond).ShouldNot(BeEmpty(),
+				"NRI stub did not receive the StopPodSandbox event")
+			Expect(stopPodSandboxEvents).To(HaveLen(1),
 				"StopPodSandbox NRI hook should fire exactly once for the first call")
 
 			By("calling StopPodSandbox again (idempotency check)")
@@ -629,19 +631,18 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"Second StopPodSandbox call MUST succeed (idempotent)")
 
 			By("verifying the second StopPodSandbox does NOT generate an NRI event")
-			// Give the runtime a moment to deliver any spurious event.
-			time.Sleep(2 * time.Second)
+			// Wait briefly, then confirm no second event was delivered.
+			Consistently(func() int {
+				count := 0
 
-			allEvents := testStub.Plugin.Events()
-			stopEventsAfter := 0
-
-			for _, e := range FilterEventsByPodID(allEvents, podID) {
-				if e.Type == EventStopPodSandbox {
-					stopEventsAfter++
+				for _, e := range FilterEventsByPodID(testStub.Plugin.Events(), podID) {
+					if e.Type == EventStopPodSandbox {
+						count++
+					}
 				}
-			}
 
-			Expect(stopEventsAfter).To(Equal(1),
+				return count
+			}, 2*time.Second, 200*time.Millisecond).Should(Equal(1),
 				"Second StopPodSandbox MUST NOT generate an NRI event — sandbox is already stopped")
 
 			By("verifying sandbox cannot be reused - CreateContainer should fail after Stop")
