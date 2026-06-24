@@ -606,13 +606,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"First StopPodSandbox call should succeed")
 
 			By("verifying the StopPodSandbox NRI hook fired exactly once")
-			// Wait for RunPodSandbox + StopPodSandbox events from the first call.
-			events, err := testStub.Plugin.WaitForEventCount(2, 10*time.Second)
+			// Poll this pod's events until the StopPodSandbox event arrives,
+			// rather than assuming a global count of exactly two events (which
+			// would break if a future runtime/NRI version emits additional
+			// lifecycle events).
+			events, err := testStub.Plugin.WaitForPodEvent(podID, EventStopPodSandbox, 10*time.Second)
 			Expect(err).NotTo(HaveOccurred(), "NRI stub did not receive the StopPodSandbox event")
 
 			stopEvents := 0
 
-			for _, e := range FilterEventsByPodID(events, podID) {
+			for _, e := range events {
 				if e.Type == EventStopPodSandbox {
 					stopEvents++
 				}
@@ -668,8 +671,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 					"spec says sandbox should never be reused after Stop")
 			}
 
-			Expect(createErr).To(HaveOccurred(),
-				"CreateContainer on a stopped sandbox MUST return an error (sandbox never reused after Stop)")
+			// Reaching here means createErr != nil, which is the spec-compliant
+			// behavior (sandbox never reused after Stop).
 
 			By("verifying the failed CreateContainer did NOT generate an NRI event")
 			time.Sleep(2 * time.Second)
