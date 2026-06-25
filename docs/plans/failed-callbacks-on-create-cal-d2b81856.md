@@ -102,10 +102,10 @@ How to validate:
 **Files:**
 - Modify: `pkg/validate/nri_linux.go`
 
-- [ ] Add `Context("RunPodSandbox error handling", Serial, ...)` with
+- [x] Add `Context("RunPodSandbox error handling", Serial, ...)` with
   `BeforeEach`/`AfterEach` mirroring the existing RunPodSandbox contract block.
-- [ ] Implement the `It("should fail RunPodSandbox and clean up when the NRI hook errors, then allow retry")` spec.
-- [ ] Ensure `AfterEach` cleans up any sandbox left behind (use
+- [x] Implement the `It("should fail RunPodSandbox and clean up when the NRI hook errors, then allow retry")` spec.
+- [x] Ensure `AfterEach` cleans up any sandbox left behind (use
   `LastRunPodSandboxID()` fallback) and the stub via `Cleanup()`.
 
 ### Task 2: CreateContainer hook error fails container creation and allows retry
