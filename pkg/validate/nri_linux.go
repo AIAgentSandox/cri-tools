@@ -1068,6 +1068,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 			testStub  *NRITestStub
 			podID     string
 			podConfig *runtimeapi.PodSandboxConfig
+			// leakedSandboxID holds a sandbox the runtime left behind after the
+			// failed attempt (spec-discrepancy path), so AfterEach can remove it
+			// in addition to the successful retry sandbox.
+			leakedSandboxID string
 		)
 
 		BeforeEach(func() {
@@ -1092,13 +1096,20 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub.Cleanup()
 			}
 
-			if cleanupID != "" {
-				if err := rc.StopPodSandbox(ctx, cleanupID); err != nil {
-					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", cleanupID, err)
+			// Remove the successful retry sandbox and, if the runtime left the
+			// failed attempt behind (spec-discrepancy path), that leaked sandbox
+			// too. Both IDs are distinct, so clean up each independently.
+			for _, id := range []string{cleanupID, leakedSandboxID} {
+				if id == "" {
+					continue
 				}
 
-				if err := rc.RemovePodSandbox(ctx, cleanupID); err != nil {
-					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", cleanupID, err)
+				if err := rc.StopPodSandbox(ctx, id); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", id, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, id); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", id, err)
 				}
 			}
 		})
@@ -1173,6 +1184,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(pod.GetState()).NotTo(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
 					"sandbox %s left behind after a failed RunPodSandbox MUST NOT be Ready", pod.GetId())
 
+				// Hand the leaked sandbox to AfterEach for removal; the retry
+				// below creates a distinct sandbox that won't cover this one.
+				leakedSandboxID = pod.GetId()
 				sandboxListedNonReady = true
 			}
 
@@ -1201,10 +1215,13 @@ var _ = framework.KubeDescribe("NRI", func() {
 			testStub  *NRITestStub
 			podID     string
 			podConfig *runtimeapi.PodSandboxConfig
-			// containerID holds any container that must be cleaned up: either a
-			// successfully created one from the retry, or a leaked container left
-			// behind by a failed CreateContainer.
+			// containerID holds the successfully created retry container so
+			// AfterEach can remove it even if an inline assertion fails.
 			containerID string
+			// leakedContainerID holds a half-created container the runtime left
+			// behind on the failed attempt (spec-discrepancy path), removed
+			// independently of the retry container.
+			leakedContainerID string
 		)
 
 		BeforeEach(func(ctx SpecContext) {
@@ -1239,13 +1256,20 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub.Cleanup()
 			}
 
-			if containerID != "" {
-				if err := rc.StopContainer(ctx, containerID, 0); err != nil {
-					framework.Logf("AfterEach: StopContainer(%s) failed: %v", containerID, err)
+			// Remove the retry container and, if the runtime leaked a half-created
+			// container on the failed attempt, that one too. The IDs are distinct,
+			// so clean up each independently.
+			for _, id := range []string{containerID, leakedContainerID} {
+				if id == "" {
+					continue
 				}
 
-				if err := rc.RemoveContainer(ctx, containerID); err != nil {
-					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", containerID, err)
+				if err := rc.StopContainer(ctx, id, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", id, err)
+				}
+
+				if err := rc.RemoveContainer(ctx, id); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", id, err)
 				}
 			}
 
@@ -1331,7 +1355,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			for _, c := range containers {
 				if c.GetMetadata() != nil && c.GetMetadata().GetName() == containerName {
 					// Capture the leaked container so AfterEach removes it.
-					containerID = c.GetId()
+					leakedContainerID = c.GetId()
 					leaked = true
 
 					break
@@ -1340,16 +1364,20 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			By("verifying the failed CreateContainer produced no StartContainer event")
 			// A leaked-then-started container would surface as a StartContainer
-			// NRI event; a clean failure produces none.
-			startCount := 0
+			// NRI event; a clean failure produces none. Use Consistently so a
+			// container started slightly after the failure is still caught rather
+			// than missed by a single early snapshot.
+			Consistently(func() int {
+				count := 0
 
-			for _, e := range testStub.Plugin.Events() {
-				if e.Type == EventStartContainer {
-					startCount++
+				for _, e := range testStub.Plugin.Events() {
+					if e.Type == EventStartContainer {
+						count++
+					}
 				}
-			}
 
-			Expect(startCount).To(BeZero(),
+				return count
+			}, 2*time.Second, 200*time.Millisecond).Should(BeZero(),
 				"a failed CreateContainer MUST NOT result in a started container")
 
 			By("retrying CreateContainer after the NRI hook stops failing")
@@ -1365,6 +1393,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 			retryID := framework.CreateContainer(ctx, rc, ic, retryConfig, podID, podConfig)
 			Expect(retryID).NotTo(BeEmpty(),
 				"CreateContainer retry should succeed after the NRI hook stops failing")
+			// Hand the retry container to AfterEach immediately so a failure in
+			// the start/stop/remove assertions below cannot leak it.
+			containerID = retryID
 
 			By("verifying the retried container can be started, stopped, and removed")
 			Expect(rc.StartContainer(ctx, retryID)).NotTo(HaveOccurred(),
