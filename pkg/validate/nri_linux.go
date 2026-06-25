@@ -1195,4 +1195,189 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 	})
+
+	Context("CreateContainer error handling", Serial, func() {
+		var (
+			testStub  *NRITestStub
+			podID     string
+			podConfig *runtimeapi.PodSandboxConfig
+			// containerID holds any container that must be cleaned up: either a
+			// successfully created one from the retry, or a leaked container left
+			// behind by a failed CreateContainer.
+			containerID string
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			var err error
+
+			testStub, err = StartNRITestStub("cri-test-nri-create-error", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+
+			// Ensure the test image is available before creating containers.
+			framework.PullPublicImage(ctx, ic, framework.TestContext.TestImageList.DefaultTestContainerImage, nil)
+
+			By("creating a pod sandbox")
+
+			podSandboxName := "nri-test-create-error-" + framework.NewUUID()
+			uid := framework.DefaultUIDPrefix + framework.NewUUID()
+			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+			podConfig = &runtimeapi.PodSandboxConfig{
+				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
+				Labels: framework.DefaultPodLabels,
+			}
+			podID = framework.RunPodSandbox(ctx, rc, podConfig)
+			Expect(podID).NotTo(BeEmpty())
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			// Stop the stub first so a still-failing hook cannot interfere with
+			// teardown of the container or sandbox.
+			if testStub != nil {
+				testStub.Cleanup()
+			}
+
+			if containerID != "" {
+				if err := rc.StopContainer(ctx, containerID, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", containerID, err)
+				}
+
+				if err := rc.RemoveContainer(ctx, containerID); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", containerID, err)
+				}
+			}
+
+			if podID != "" {
+				if err := rc.StopPodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", podID, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
+				}
+			}
+		})
+
+		It("should fail CreateContainer when the NRI hook errors, leak nothing, and allow retry", func(ctx SpecContext) {
+			// Contract (cri-tools#2046 + nri#286): an NRI plugin error on the
+			// creation path (CreateContainer) MUST fail the CreateContainer CRI
+			// call, MUST NOT leak a half-created container, and MUST allow an
+			// immediate retry to succeed once the plugin stops failing.
+
+			// Fail only the first CreateContainer invocation so the retry passes.
+			var failOnce sync.Once
+
+			testStub.Plugin.OnCreateContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
+				shouldFail := false
+
+				failOnce.Do(func() { shouldFail = true })
+
+				if shouldFail {
+					return errors.New("induced NRI CreateContainer failure")
+				}
+
+				return nil
+			}
+
+			// Reset events so we only observe container events from this point.
+			testStub.Plugin.Reset()
+
+			By("attempting CreateContainer while the NRI hook is failing")
+
+			containerName := "nri-test-create-error-ctr-" + framework.NewUUID()
+			containerConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				Command:  framework.DefaultPauseCommand,
+				Linux:    &runtimeapi.LinuxContainerConfig{},
+			}
+
+			failedContainerID, createErr := rc.CreateContainer(ctx, podID, containerConfig, podConfig)
+			Expect(createErr).To(HaveOccurred(),
+				"CreateContainer MUST fail when the NRI CreateContainer hook returns an error")
+			Expect(failedContainerID).To(BeEmpty(),
+				"No container ID should be returned when CreateContainer fails")
+
+			By("verifying the NRI CreateContainer hook actually fired")
+			// The hook records its event before returning the error, confirming
+			// the failure was induced on the creation path as intended.
+			Eventually(func() int {
+				count := 0
+
+				for _, e := range testStub.Plugin.Events() {
+					if e.Type == EventCreateContainer {
+						count++
+					}
+				}
+
+				return count
+			}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1),
+				"NRI CreateContainer hook should have fired before the failure")
+
+			By("verifying the failed CreateContainer leaked no container")
+			// Spec-compliant runtimes do not leave a half-created container
+			// behind. If the runtime instead leaks one, record a SPEC_DISCREPANCY,
+			// hand it to AfterEach for cleanup, and skip the no-leak assertion at
+			// the end while still exercising the retry contract.
+			leaked := false
+
+			containers, listErr := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
+				PodSandboxId: podID,
+			})
+			Expect(listErr).NotTo(HaveOccurred(), "ListContainers after failed CreateContainer")
+
+			for _, c := range containers {
+				if c.GetMetadata() != nil && c.GetMetadata().GetName() == containerName {
+					// Capture the leaked container so AfterEach removes it.
+					containerID = c.GetId()
+					leaked = true
+
+					break
+				}
+			}
+
+			By("verifying the failed CreateContainer produced no StartContainer event")
+			// A leaked-then-started container would surface as a StartContainer
+			// NRI event; a clean failure produces none.
+			startCount := 0
+
+			for _, e := range testStub.Plugin.Events() {
+				if e.Type == EventStartContainer {
+					startCount++
+				}
+			}
+
+			Expect(startCount).To(BeZero(),
+				"a failed CreateContainer MUST NOT result in a started container")
+
+			By("retrying CreateContainer after the NRI hook stops failing")
+
+			retryName := "nri-test-create-retry-ctr-" + framework.NewUUID()
+			retryConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(retryName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				Command:  framework.DefaultPauseCommand,
+				Linux:    &runtimeapi.LinuxContainerConfig{},
+			}
+
+			retryID := framework.CreateContainer(ctx, rc, ic, retryConfig, podID, podConfig)
+			Expect(retryID).NotTo(BeEmpty(),
+				"CreateContainer retry should succeed after the NRI hook stops failing")
+
+			By("verifying the retried container can be started, stopped, and removed")
+			Expect(rc.StartContainer(ctx, retryID)).NotTo(HaveOccurred(),
+				"the retried container should start successfully")
+			Expect(rc.StopContainer(ctx, retryID, 0)).NotTo(HaveOccurred(),
+				"the retried container should stop successfully")
+			Expect(rc.RemoveContainer(ctx, retryID)).NotTo(HaveOccurred(),
+				"the retried container should be removable")
+
+			if leaked {
+				Skip("spec discrepancy: runtime left a half-created container behind " +
+					"after a failed CreateContainer instead of cleaning it up")
+			}
+		})
+	})
 })

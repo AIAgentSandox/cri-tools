@@ -4,7 +4,7 @@
 
 ### Task 1: failed callbacks on create calls
 
-- [ ] # More Test Cases for NRI Plugin
+- [x] # More Test Cases for NRI Plugin
 
 ## Overview
 
@@ -133,7 +133,7 @@ How to validate:
 **Files:**
 - Modify: `pkg/validate/nri_linux.go`
 
-- [ ] Add `Context("CreateContainer error handling", Serial, ...)` with
+- [x] Add `Context("CreateContainer error handling", Serial, ...)` with
   `BeforeEach` (start stub, pull image, create pod) and `AfterEach` cleanup.
-- [ ] Implement `It("should fail CreateContainer when the NRI hook errors, leak nothing, and allow retry")`.
-- [ ] Build, vet, and lint the package clean.
+- [x] Implement `It("should fail CreateContainer when the NRI hook errors, leak nothing, and allow retry")`.
+- [x] Build, vet, and lint the package clean.
