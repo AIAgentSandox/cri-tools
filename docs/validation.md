@@ -105,7 +105,7 @@ critest connects to Unix: `unix:///run/containerd/containerd.sock` or Windows: `
 
 - `-nri-socket`: Path to the NRI socket (e.g., `/var/run/nri/nri.sock`). When set, NRI integration tests are enabled. When not set, NRI tests are skipped.
 
-NRI tests validate runtime behavior when NRI plugins are active. They verify plugin lifecycle hooks (RunPodSandbox, StopPodSandbox, RemovePodSandbox, CreateContainer, StartContainer, StopContainer, RemoveContainer), failure handling, retry semantics, blocking behavior, and multi-plugin ordering guarantees.
+NRI tests validate runtime behavior when NRI plugins are active. They verify plugin lifecycle hooks (RunPodSandbox, StopPodSandbox, RemovePodSandbox, CreateContainer, StartContainer, StopContainer, RemoveContainer), failure handling, retry semantics, blocking behavior, multi-plugin ordering guarantees, and Synchronize-based reconciliation for late-joining plugins (a plugin that connects after pods and containers already exist must receive them via its Synchronize callback, and a container created during the Synchronize window must not be lost — it must arrive either in the Synchronize set or via a later CreateContainer callback).
 
 NRI tests are Linux-only and marked `[Serial]` because they register NRI plugins that affect runtime-wide behavior.
 
