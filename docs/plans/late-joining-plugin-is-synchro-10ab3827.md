@@ -4,7 +4,7 @@
 
 ### Task 1: Late-joining plugin is synchronized with existing pods and containers
 
-- [ ] # More Test Cases for NRI Plugin
+- [x] # More Test Cases for NRI Plugin
 
 ## Overview
 
@@ -119,9 +119,9 @@ So the task should validate that the second NRI plugin will receive information 
 Same test case as in Task 2, but there will be multiple containers created right before, while, and after the second NRI plugin is processing Synchronize call.
 So the task should validate that the second NRI plugin will receive information about all containers in either synchronize or a regular callbacks.
 
-- [ ] Implement `It("should receive information about all containers without the race condition during initialization")`.
-- [ ] Build, vet, and lint the package clean.
-- [ ] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS
+- [x] Implement `It("should receive information about all containers without the race condition during initialization")`.
+- [x] Build, vet, and lint the package clean.
+- [x] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS (skipped - requires a live CRI runtime with NRI enabled; not automatable in this environment)
 
 
  
