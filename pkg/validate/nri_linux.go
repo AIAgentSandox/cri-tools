@@ -782,6 +782,81 @@ var _ = framework.KubeDescribe("NRI", func() {
 				framework.Logf("RemoveContainer(%s) failed: %v", containerID, err)
 			}
 		})
+
+		It("should fail RunPodSandbox and clean up when the NRI hook errors, then allow retry", func(ctx SpecContext) {
+			var err error
+
+			testStub, err = StartNRITestStub("cri-test-nri-run-error", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+
+			// Fail only the first RunPodSandbox invocation so the retry can pass.
+			var failOnce sync.Once
+
+			testStub.Plugin.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
+				shouldFail := false
+
+				failOnce.Do(func() { shouldFail = true })
+
+				if shouldFail {
+					return errors.New("induced NRI RunPodSandbox failure")
+				}
+
+				return nil
+			}
+
+			By("building the pod sandbox config")
+
+			podSandboxName := "nri-test-run-error-" + framework.NewUUID()
+			uid := framework.DefaultUIDPrefix + framework.NewUUID()
+			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+			podConfig = &runtimeapi.PodSandboxConfig{
+				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
+				Labels: framework.DefaultPodLabels,
+			}
+
+			By("attempting RunPodSandbox while the NRI hook is failing")
+
+			failedPodID, runErr := rc.RunPodSandbox(ctx, podConfig, framework.TestContext.RuntimeHandler)
+			Expect(runErr).To(HaveOccurred(),
+				"RunPodSandbox MUST fail when the NRI RunPodSandbox hook returns an error")
+			Expect(failedPodID).To(BeEmpty(),
+				"No pod sandbox ID should be returned when RunPodSandbox fails")
+
+			By("verifying the NRI RunPodSandbox hook actually fired")
+			// The hook records its event before returning the error, so the
+			// attempted sandbox ID is available for the cleanup/leak check.
+			attemptedID := testStub.Plugin.LastRunPodSandboxID()
+			Expect(attemptedID).NotTo(BeEmpty(),
+				"NRI RunPodSandbox hook should have fired before the failure")
+
+			By("verifying the failed sandbox is not left behind")
+
+			pods, listErr := rc.ListPodSandbox(ctx, nil)
+			Expect(listErr).NotTo(HaveOccurred())
+
+			for _, pod := range pods {
+				matches := pod.GetId() == attemptedID ||
+					(pod.GetMetadata() != nil && pod.GetMetadata().GetName() == podSandboxName)
+				Expect(matches).To(BeFalse(),
+					"sandbox %s MUST be cleaned up after a failed RunPodSandbox", pod.GetId())
+			}
+
+			By("retrying RunPodSandbox after the NRI hook stops failing")
+
+			podID = framework.RunPodSandbox(ctx, rc, podConfig)
+			Expect(podID).NotTo(BeEmpty(),
+				"RunPodSandbox retry should succeed after the NRI hook stops failing")
+
+			By("verifying the retried sandbox becomes Ready")
+
+			statusResp, err := rc.PodSandboxStatus(ctx, podID, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(statusResp.GetStatus().GetState()).To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
+				"sandbox should become Ready after a successful RunPodSandbox retry")
+		})
 	})
 
 	Context("StopPodSandbox contract", Serial, func() {
@@ -1060,153 +1135,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 				return count
 			}, 2*time.Second, 200*time.Millisecond).Should(Equal(0),
 				"Failed CreateContainer on a stopped sandbox MUST NOT generate an NRI CreateContainer event")
-		})
-	})
-
-	Context("RunPodSandbox error handling", Serial, func() {
-		var (
-			testStub  *NRITestStub
-			podID     string
-			podConfig *runtimeapi.PodSandboxConfig
-			// leakedSandboxID holds a sandbox the runtime left behind after the
-			// failed attempt (spec-discrepancy path), so AfterEach can remove it
-			// in addition to the successful retry sandbox.
-			leakedSandboxID string
-		)
-
-		BeforeEach(func() {
-			var err error
-
-			testStub, err = StartNRITestStub("cri-test-nri-run-error", "00")
-			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
-		})
-
-		AfterEach(func(ctx SpecContext) {
-			// Capture a fallback sandbox ID before cleanup resets events: the
-			// first (failed) attempt may have left a sandbox behind that the
-			// CRI call never returned an ID for.
-			cleanupID := podID
-			if cleanupID == "" && testStub != nil {
-				cleanupID = testStub.Plugin.LastRunPodSandboxID()
-			}
-
-			// Stop the stub first so a still-failing hook cannot interfere with
-			// teardown of any sandbox left behind.
-			if testStub != nil {
-				testStub.Cleanup()
-			}
-
-			// Remove the successful retry sandbox and, if the runtime left the
-			// failed attempt behind (spec-discrepancy path), that leaked sandbox
-			// too. Both IDs are distinct, so clean up each independently.
-			for _, id := range []string{cleanupID, leakedSandboxID} {
-				if id == "" {
-					continue
-				}
-
-				if err := rc.StopPodSandbox(ctx, id); err != nil {
-					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", id, err)
-				}
-
-				if err := rc.RemovePodSandbox(ctx, id); err != nil {
-					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", id, err)
-				}
-			}
-		})
-
-		It("should fail RunPodSandbox and clean up when the NRI hook errors, then allow retry", func(ctx SpecContext) {
-			// Contract (cri-tools#2046 + nri#286): an NRI plugin error on the
-			// creation path (RunPodSandbox) MAY block the operation, but the
-			// runtime MUST fail the RunPodSandbox CRI call, MUST NOT leave a
-			// Ready sandbox behind, and MUST allow an immediate retry to succeed
-			// once the plugin stops failing.
-
-			// Fail only the first RunPodSandbox invocation so the retry can pass.
-			var failOnce sync.Once
-
-			testStub.Plugin.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
-				shouldFail := false
-
-				failOnce.Do(func() { shouldFail = true })
-
-				if shouldFail {
-					return errors.New("induced NRI RunPodSandbox failure")
-				}
-
-				return nil
-			}
-
-			By("building the pod sandbox config")
-
-			podSandboxName := "nri-test-run-error-" + framework.NewUUID()
-			uid := framework.DefaultUIDPrefix + framework.NewUUID()
-			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-			podConfig = &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
-				Linux: &runtimeapi.LinuxPodSandboxConfig{
-					CgroupParent: common.GetCgroupParent(ctx, rc),
-				},
-				Labels: framework.DefaultPodLabels,
-			}
-
-			By("attempting RunPodSandbox while the NRI hook is failing")
-
-			failedPodID, runErr := rc.RunPodSandbox(ctx, podConfig, framework.TestContext.RuntimeHandler)
-			Expect(runErr).To(HaveOccurred(),
-				"RunPodSandbox MUST fail when the NRI RunPodSandbox hook returns an error")
-			Expect(failedPodID).To(BeEmpty(),
-				"No pod sandbox ID should be returned when RunPodSandbox fails")
-
-			By("verifying the NRI RunPodSandbox hook actually fired")
-			// The hook records its event before returning the error, so the
-			// attempted sandbox ID is available for the cleanup/leak check.
-			attemptedID := testStub.Plugin.LastRunPodSandboxID()
-			Expect(attemptedID).NotTo(BeEmpty(),
-				"NRI RunPodSandbox hook should have fired before the failure")
-
-			By("verifying the failed sandbox is not left behind in a Ready state")
-			// Spec-compliant runtimes clean up the partially-created sandbox. If
-			// the runtime instead leaves it listed in a non-Ready state, record a
-			// SPEC_DISCREPANCY and Skip the not-listed assertion at the end while
-			// still exercising the retry contract.
-			sandboxListedNonReady := false
-
-			pods, listErr := rc.ListPodSandbox(ctx, nil)
-			Expect(listErr).NotTo(HaveOccurred())
-
-			for _, pod := range pods {
-				matches := pod.GetId() == attemptedID ||
-					(pod.GetMetadata() != nil && pod.GetMetadata().GetName() == podSandboxName)
-				if !matches {
-					continue
-				}
-
-				Expect(pod.GetState()).NotTo(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
-					"sandbox %s left behind after a failed RunPodSandbox MUST NOT be Ready", pod.GetId())
-
-				// Hand the leaked sandbox to AfterEach for removal; the retry
-				// below creates a distinct sandbox that won't cover this one.
-				leakedSandboxID = pod.GetId()
-				sandboxListedNonReady = true
-			}
-
-			By("retrying RunPodSandbox after the NRI hook stops failing")
-
-			podID = framework.RunPodSandbox(ctx, rc, podConfig)
-			Expect(podID).NotTo(BeEmpty(),
-				"RunPodSandbox retry should succeed after the NRI hook stops failing")
-
-			By("verifying the retried sandbox becomes Ready")
-
-			statusResp, err := rc.PodSandboxStatus(ctx, podID, false)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(statusResp.GetStatus().GetState()).To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
-				"sandbox should become Ready after a successful RunPodSandbox retry")
-
-			if sandboxListedNonReady {
-				Skip("spec discrepancy: runtime left the failed sandbox listed in a non-Ready " +
-					"state instead of removing it after a failed RunPodSandbox")
-			}
 		})
 	})
 
