@@ -4,7 +4,7 @@
 
 ### Task 1: StopPodSandbox NRI failure test
 
-- [ ] # More Test Cases for NRI Plugin
+- [x] # More Test Cases for NRI Plugin
 
 ## Overview
 
@@ -92,7 +92,7 @@ How to validate:
 **Files:**
 - Modify: `pkg/validate/nri_linux.go`
 
-- [ ] Add a `Context("teardown hook error handling", Serial, ...)` block (this
+- [x] Add a `Context("teardown hook error handling", Serial, ...)` block (this
   context will also host Tasks 4 and 6) with shared `BeforeEach`/`AfterEach`.
-- [ ] Implement `It("should stop the sandbox even when the StopPodSandbox NRI hook returns an error")`.
-- [ ] Build, vet, and lint the package clean.
+- [x] Implement `It("should stop the sandbox even when the StopPodSandbox NRI hook returns an error")`.
+- [x] Build, vet, and lint the package clean.
