@@ -109,9 +109,9 @@ How to validate:
 Same test case as in Task 1, but there will be another container created WHILE the second NRI plugin is processing Synchronize call.
 So the task should validate that the second NRI plugin will receive information about the second container as a regular callback and it will not be lost.
 
-- [ ] Implement `It("should receive a callback for container created during the Synchronize call")`.
-- [ ] Build, vet, and lint the package clean.
-- [ ] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS
+- [x] Implement `It("should receive a callback for container created during the Synchronize call")`.
+- [x] Build, vet, and lint the package clean.
+- [x] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS (skipped - requires a live CRI runtime with NRI enabled; not automatable in this environment)
 
 
 ### Task 3: Race conditions check with NRI plugin

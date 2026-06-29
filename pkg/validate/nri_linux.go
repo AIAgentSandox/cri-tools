@@ -19,6 +19,7 @@ package validate
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -1156,6 +1157,216 @@ var _ = framework.KubeDescribe("NRI", func() {
 			By("verifying the second plugin's Synchronize received the existing container")
 			Expect(secondStub.Plugin.SyncedContainers()).To(ContainElement(containerID),
 				"second plugin's Synchronize MUST include existing container %s", containerID)
+		})
+	})
+
+	Context("plugin synchronization (container created during Synchronize)", Serial, func() {
+		var (
+			firstStub    *NRITestStub
+			podID        string
+			podConfig    *runtimeapi.PodSandboxConfig
+			containerID  string
+			containerID2 string
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			var err error
+
+			firstStub, err = StartNRITestStub("cri-test-nri-sync2-first", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start first NRI test stub")
+
+			// Ensure test image is available
+			framework.PullPublicImage(ctx, ic, framework.TestContext.TestImageList.DefaultTestContainerImage, nil)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			for _, id := range []string{containerID, containerID2} {
+				if id == "" {
+					continue
+				}
+
+				if err := rc.StopContainer(ctx, id, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", id, err)
+				}
+
+				if err := rc.RemoveContainer(ctx, id); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", id, err)
+				}
+			}
+
+			if podID != "" {
+				if err := rc.StopPodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", podID, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
+				}
+			}
+
+			if firstStub != nil {
+				firstStub.Cleanup()
+			}
+		})
+
+		It("should receive a callback for container created during the Synchronize call", func(ctx SpecContext) {
+			// Contract: a container created WHILE a late-joining plugin is still
+			// processing its Synchronize callback MUST NOT be lost. The plugin
+			// must learn about it either as part of the Synchronize set or via a
+			// regular CreateContainer callback delivered after Synchronize
+			// returns.
+			By("creating a pod sandbox before the second plugin connects")
+
+			podSandboxName := "nri-test-sync2-" + framework.NewUUID()
+			uid := framework.DefaultUIDPrefix + framework.NewUUID()
+			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+			podConfig = &runtimeapi.PodSandboxConfig{
+				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
+				Labels: framework.DefaultPodLabels,
+			}
+			podID = framework.RunPodSandbox(ctx, rc, podConfig)
+			Expect(podID).NotTo(BeEmpty())
+
+			By("creating and starting a container before the second plugin connects")
+
+			containerName := "nri-test-sync2-ctr-" + framework.NewUUID()
+			containerConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				Command:  framework.DefaultPauseCommand,
+				Linux:    &runtimeapi.LinuxContainerConfig{},
+			}
+			containerID = framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
+			Expect(containerID).NotTo(BeEmpty())
+			Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
+
+			// Coordination channels for blocking inside the second plugin's
+			// Synchronize callback. syncOnce guards against the (legal) case of
+			// Synchronize being invoked more than once, which would panic on a
+			// double close of syncReached.
+			syncReached := make(chan struct{})
+			syncRelease := make(chan struct{})
+
+			var syncOnce sync.Once
+
+			configure := func(p *NRITestPlugin) {
+				p.OnSynchronize = func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
+					first := false
+
+					syncOnce.Do(func() { first = true })
+					// Only the first invocation participates in the handshake;
+					// any later one returns immediately so cleanup is not blocked.
+					if !first {
+						return nil
+					}
+
+					close(syncReached)
+
+					select {
+					case <-syncRelease:
+					case <-hookCtx.Done():
+					}
+
+					return nil
+				}
+			}
+
+			By("connecting a second plugin whose Synchronize blocks")
+			// StartNRITestStub blocks until the plugin becomes ready, which only
+			// happens after Synchronize (and thus our blocking hook) returns, so
+			// run it in a goroutine while we drive runtime state from the test.
+			var (
+				secondStub *NRITestStub
+				startErr   error
+				startWg    sync.WaitGroup
+			)
+
+			startWg.Go(func() {
+				secondStub, startErr = StartNRITestStub("cri-test-nri-sync2-second", "10", configure)
+			})
+
+			By("waiting for the second plugin's Synchronize to begin")
+
+			select {
+			case <-syncReached:
+				// Synchronize is now blocking inside our hook.
+			case <-time.After(30 * time.Second):
+				close(syncRelease) // unblock to avoid leaking the goroutine
+				startWg.Wait()
+				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
+			}
+
+			By("creating a second container while the second plugin's Synchronize is in progress")
+
+			secondContainerName := "nri-test-sync2-ctr2-" + framework.NewUUID()
+			secondContainerConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(secondContainerName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				Command:  framework.DefaultPauseCommand,
+				Linux:    &runtimeapi.LinuxContainerConfig{},
+			}
+
+			// Create the second container in a goroutine: depending on the
+			// runtime, the CRI CreateContainer call may block until the
+			// in-progress Synchronize returns, so it must not block the test.
+			var (
+				createdID string
+				createWg  sync.WaitGroup
+			)
+
+			createWg.Go(func() {
+				defer GinkgoRecover()
+
+				id := framework.CreateContainer(ctx, rc, ic, secondContainerConfig, podID, podConfig)
+				Expect(id).NotTo(BeEmpty())
+				Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
+				createdID = id
+			})
+
+			// Hold the Synchronize call open briefly so the CreateContainer
+			// request is in flight at the runtime while the second plugin is
+			// still synchronizing. This is coordination to widen the race
+			// window, not an assertion.
+			time.Sleep(2 * time.Second)
+
+			By("releasing the second plugin's Synchronize")
+			close(syncRelease)
+
+			By("waiting for the second plugin to become ready")
+			startWg.Wait()
+			Expect(startErr).NotTo(HaveOccurred(), "second NRI test stub failed to become ready")
+
+			defer secondStub.Cleanup()
+
+			By("waiting for the second container to be created")
+			createWg.Wait()
+			Expect(createdID).NotTo(BeEmpty())
+			containerID2 = createdID
+
+			By("verifying the second plugin learns about the container created during Synchronize")
+			// The container must reach the second plugin one of two ways: it was
+			// part of the Synchronize set, or it arrived as a regular
+			// CreateContainer callback after Synchronize completed. Either is
+			// spec-compliant; what is forbidden is losing it entirely.
+			Eventually(func() bool {
+				if slices.Contains(secondStub.Plugin.SyncedContainers(), containerID2) {
+					return true
+				}
+
+				for _, e := range secondStub.Plugin.Events() {
+					if e.Type == EventCreateContainer && e.ContainerID == containerID2 {
+						return true
+					}
+				}
+
+				return false
+			}, 15*time.Second, 100*time.Millisecond).Should(BeTrue(),
+				"second plugin MUST receive container %s created during Synchronize, "+
+					"either in the Synchronize set or via a CreateContainer callback (it MUST NOT be lost)",
+				containerID2)
 		})
 	})
 })
