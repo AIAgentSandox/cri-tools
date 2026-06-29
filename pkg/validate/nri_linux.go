@@ -1322,8 +1322,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				id := framework.CreateContainer(ctx, rc, ic, secondContainerConfig, podID, podConfig)
 				Expect(id).NotTo(BeEmpty())
-				Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
+				// Publish the ID before starting so AfterEach can clean the
+				// container up even if StartContainer fails or times out.
 				createdID = id
+				Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
 			})
 
 			// Hold the Synchronize call open briefly so the CreateContainer
@@ -1475,8 +1477,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				id := framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
 				Expect(id).NotTo(BeEmpty())
-				Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
+				// Record the ID before starting so AfterEach can clean the
+				// container up even if StartContainer fails or times out.
 				recordContainer(id)
+				Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
 
 				return id
 			}
