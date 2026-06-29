@@ -1357,22 +1357,24 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 			}
 
-			By("verifying the failed CreateContainer produced no further NRI container events")
-			// A failed CreateContainer MUST NOT trigger any subsequent container
-			// lifecycle events (Start, Stop, Remove). Use Consistently so events
-			// delivered slightly after the failure are still caught.
+			By("verifying the failed CreateContainer did not start a container")
+			// A failed CreateContainer MUST NOT result in a started container.
+			// The runtime may emit Stop/Remove events as part of internal cleanup
+			// of the partially created container, but a StartContainer event must
+			// never appear. Use Consistently so events delivered slightly after the
+			// failure are still caught.
 			Consistently(func() int {
 				count := 0
 
 				for _, e := range testStub.Plugin.Events() {
-					if e.Type == EventStartContainer || e.Type == EventStopContainer || e.Type == EventRemoveContainer {
+					if e.Type == EventStartContainer {
 						count++
 					}
 				}
 
 				return count
 			}, 2*time.Second, 200*time.Millisecond).Should(BeZero(),
-				"a failed CreateContainer MUST NOT produce any subsequent NRI container events")
+				"a failed CreateContainer MUST NOT result in a started container")
 
 			By("retrying CreateContainer after the NRI hook stops failing")
 
