@@ -66,6 +66,12 @@ type NRITestPlugin struct {
 	ready     chan struct{}
 	readyOnce sync.Once
 
+	// syncPods/syncContainers capture the pod and container IDs passed to the
+	// most recent Synchronize call, so tests can assert that a late-joining
+	// plugin is reconciled with the runtime's existing state.
+	syncPods       []string
+	syncContainers []string
+
 	// Hook callbacks - if set, called during the respective hook.
 	// Return an error to simulate plugin failure.
 	OnRunPodSandbox    func(ctx context.Context, pod *nri.PodSandbox) error
@@ -78,11 +84,49 @@ type NRITestPlugin struct {
 }
 
 // Synchronize implements stub.SynchronizeInterface.
-// It signals readiness (registration/configuration complete) via the ready channel.
-func (p *NRITestPlugin) Synchronize(_ context.Context, _ []*nri.PodSandbox, _ []*nri.Container) ([]*nri.ContainerUpdate, error) {
+// It captures the existing pods/containers the runtime reconciles the plugin
+// with, then signals readiness (registration/configuration complete) via the
+// ready channel.
+func (p *NRITestPlugin) Synchronize(_ context.Context, pods []*nri.PodSandbox, containers []*nri.Container) ([]*nri.ContainerUpdate, error) {
+	p.mu.Lock()
+
+	p.syncPods = make([]string, 0, len(pods))
+	for _, pod := range pods {
+		p.syncPods = append(p.syncPods, pod.GetId())
+	}
+
+	p.syncContainers = make([]string, 0, len(containers))
+	for _, container := range containers {
+		p.syncContainers = append(p.syncContainers, container.GetId())
+	}
+
+	p.mu.Unlock()
+
 	p.readyOnce.Do(func() { close(p.ready) })
 
 	return nil, nil
+}
+
+// SyncedPods returns the pod sandbox IDs passed to the most recent Synchronize call.
+func (p *NRITestPlugin) SyncedPods() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	result := make([]string, len(p.syncPods))
+	copy(result, p.syncPods)
+
+	return result
+}
+
+// SyncedContainers returns the container IDs passed to the most recent Synchronize call.
+func (p *NRITestPlugin) SyncedContainers() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	result := make([]string, len(p.syncContainers))
+	copy(result, p.syncContainers)
+
+	return result
 }
 
 // RunPodSandbox implements stub.RunPodInterface.

@@ -1061,4 +1061,101 @@ var _ = framework.KubeDescribe("NRI", func() {
 				"Failed CreateContainer on a stopped sandbox MUST NOT generate an NRI CreateContainer event")
 		})
 	})
+
+	Context("plugin synchronization", Serial, func() {
+		var (
+			firstStub   *NRITestStub
+			podID       string
+			podConfig   *runtimeapi.PodSandboxConfig
+			containerID string
+		)
+
+		BeforeEach(func(ctx SpecContext) {
+			var err error
+
+			firstStub, err = StartNRITestStub("cri-test-nri-sync-first", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start first NRI test stub")
+
+			// Ensure test image is available
+			framework.PullPublicImage(ctx, ic, framework.TestContext.TestImageList.DefaultTestContainerImage, nil)
+		})
+
+		AfterEach(func(ctx SpecContext) {
+			if containerID != "" {
+				if err := rc.StopContainer(ctx, containerID, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", containerID, err)
+				}
+
+				if err := rc.RemoveContainer(ctx, containerID); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", containerID, err)
+				}
+			}
+
+			if podID != "" {
+				if err := rc.StopPodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", podID, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, podID); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
+				}
+			}
+
+			if firstStub != nil {
+				firstStub.Cleanup()
+			}
+		})
+
+		It("should synchronize a newly connected plugin with existing pods and containers", func(ctx SpecContext) {
+			// Contract: when a plugin connects to the runtime, the runtime calls
+			// Synchronize with the current set of pods and containers so the
+			// plugin can reconcile existing state. A plugin that connects AFTER a
+			// pod and container already exist MUST receive those existing
+			// pods/containers in its Synchronize callback.
+			By("creating a pod sandbox before the second plugin connects")
+
+			podSandboxName := "nri-test-sync-" + framework.NewUUID()
+			uid := framework.DefaultUIDPrefix + framework.NewUUID()
+			namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+			podConfig = &runtimeapi.PodSandboxConfig{
+				Metadata: framework.BuildPodSandboxMetadata(podSandboxName, uid, namespace, framework.DefaultAttempt),
+				Linux: &runtimeapi.LinuxPodSandboxConfig{
+					CgroupParent: common.GetCgroupParent(ctx, rc),
+				},
+				Labels: framework.DefaultPodLabels,
+			}
+			podID = framework.RunPodSandbox(ctx, rc, podConfig)
+			Expect(podID).NotTo(BeEmpty())
+
+			By("creating and starting a container before the second plugin connects")
+
+			containerName := "nri-test-sync-ctr-" + framework.NewUUID()
+			containerConfig := &runtimeapi.ContainerConfig{
+				Metadata: framework.BuildContainerMetadata(containerName, framework.DefaultAttempt),
+				Image:    &runtimeapi.ImageSpec{Image: framework.TestContext.TestImageList.DefaultTestContainerImage},
+				Command:  framework.DefaultPauseCommand,
+				Linux:    &runtimeapi.LinuxContainerConfig{},
+			}
+			containerID = framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
+			Expect(containerID).NotTo(BeEmpty())
+			Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
+
+			By("connecting a second plugin after the pod and container already exist")
+			// StartNRITestStub returns only after the stub's Synchronize callback
+			// has fired (plugin.ready is closed inside Synchronize), so the
+			// captured sync state is populated by the time it returns.
+			secondStub, err := StartNRITestStub("cri-test-nri-sync-second", "10")
+			Expect(err).NotTo(HaveOccurred(), "failed to start second NRI test stub")
+
+			defer secondStub.Cleanup()
+
+			By("verifying the second plugin's Synchronize received the existing pod")
+			Expect(secondStub.Plugin.SyncedPods()).To(ContainElement(podID),
+				"second plugin's Synchronize MUST include existing pod %s", podID)
+
+			By("verifying the second plugin's Synchronize received the existing container")
+			Expect(secondStub.Plugin.SyncedContainers()).To(ContainElement(containerID),
+				"second plugin's Synchronize MUST include existing container %s", containerID)
+		})
+	})
 })

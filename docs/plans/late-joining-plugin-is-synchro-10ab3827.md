@@ -98,11 +98,11 @@ How to validate:
 - Modify: `pkg/validate/nri_util_linux.go` (capture Synchronize args + accessors)
 - Modify: `pkg/validate/nri_linux.go` (new Context/It)
 
-- [ ] Add captured `syncPods`/`syncContainers` fields + accessors to
+- [x] Add captured `syncPods`/`syncContainers` fields + accessors to
   `NRITestPlugin`, populated in `Synchronize` under the mutex.
-- [ ] Implement `It("should synchronize a newly connected plugin with existing pods and containers")`.
-- [ ] Build, vet, and lint the package clean.
-- [ ] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS
+- [x] Implement `It("should synchronize a newly connected plugin with existing pods and containers")`.
+- [x] Build, vet, and lint the package clean.
+- [x] Run new test with containerd main and 2.2 using make test-e2e-critest with appropriate FOCUS (skipped - requires a live CRI runtime with NRI enabled; not automatable in this environment)
 
 ### Task 2: Late-joining plugin is synchronized with container created during the initialization
 
