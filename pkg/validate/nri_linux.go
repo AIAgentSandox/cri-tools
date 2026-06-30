@@ -1923,6 +1923,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 					"but containerd does not yet implement this guarantee under concurrent creation",
 					len(lostContainers), lostContainers))
 			}
+
+			framework.Logf("all %d containers reached the late-joining plugin", len(allIDs))
 		})
 	})
 })
