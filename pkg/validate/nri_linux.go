@@ -1429,6 +1429,129 @@ var _ = framework.KubeDescribe("NRI", func() {
 			createdContainers = append(createdContainers, id)
 		}
 
+		// startBlockingSyncPlugin connects a second plugin named `name` whose
+		// Synchronize callback blocks until release() is called, then waits
+		// until that callback has fired. It returns release (idempotent) and
+		// waitReady, which blocks until the plugin finishes connecting and
+		// returns the ready stub. Callers MUST eventually call release followed
+		// by waitReady. syncOnce guards against the (legal) case of Synchronize
+		// being invoked more than once, which would panic on a double close of
+		// syncReached.
+		startBlockingSyncPlugin := func(name string) (release func(), waitReady func() *NRITestStub) {
+			// Coordination channels for blocking inside the plugin's
+			// Synchronize callback.
+			syncReached := make(chan struct{})
+			syncRelease := make(chan struct{})
+
+			var syncOnce sync.Once
+
+			configure := func(p *NRITestPlugin) {
+				p.OnSynchronize = func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
+					first := false
+
+					syncOnce.Do(func() { first = true })
+					// Only the first invocation participates in the handshake;
+					// any later one returns immediately so cleanup is not blocked.
+					if !first {
+						return nil
+					}
+
+					close(syncReached)
+
+					select {
+					case <-syncRelease:
+					case <-hookCtx.Done():
+					}
+
+					return nil
+				}
+			}
+
+			// StartNRITestStub blocks until the plugin becomes ready, which only
+			// happens after Synchronize (and thus our blocking hook) returns, so
+			// run it in a goroutine while the caller drives runtime state.
+			var (
+				stub     *NRITestStub
+				startErr error
+				startWg  sync.WaitGroup
+			)
+
+			startWg.Go(func() {
+				stub, startErr = StartNRITestStub(name, "10", configure)
+			})
+
+			var releaseOnce sync.Once
+
+			release = func() { releaseOnce.Do(func() { close(syncRelease) }) }
+
+			select {
+			case <-syncReached:
+				// Synchronize is now blocking inside our hook.
+			case <-time.After(30 * time.Second):
+				release() // unblock to avoid leaking the goroutine
+				startWg.Wait()
+				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
+			}
+
+			waitReady = func() *NRITestStub {
+				startWg.Wait()
+				Expect(startErr).NotTo(HaveOccurred(), "second NRI test stub failed to become ready")
+
+				return stub
+			}
+
+			return release, waitReady
+		}
+
+		// pluginSeesContainer reports whether the plugin learned about container
+		// id one of the two spec-compliant ways: it was part of the Synchronize
+		// set, or it arrived as a regular CreateContainer callback.
+		pluginSeesContainer := func(stub *NRITestStub, id string) bool {
+			if slices.Contains(stub.Plugin.SyncedContainers(), id) {
+				return true
+			}
+
+			for _, e := range stub.Plugin.Events() {
+				if e.Type == EventCreateContainer && e.ContainerID == id {
+					return true
+				}
+			}
+
+			return false
+		}
+
+		// pollForLostContainers polls until the plugin has seen every id or the
+		// timeout expires, returning the IDs the plugin never learned about
+		// (nil when all were delivered).
+		pollForLostContainers := func(stub *NRITestStub, ids ...string) []string {
+			var lost []string
+
+			timeout := time.After(15 * time.Second)
+			ticker := time.NewTicker(100 * time.Millisecond)
+
+			defer ticker.Stop()
+
+			for {
+				lost = nil
+
+				for _, id := range ids {
+					if !pluginSeesContainer(stub, id) {
+						lost = append(lost, id)
+					}
+				}
+
+				if len(lost) == 0 {
+					return nil
+				}
+
+				select {
+				case <-timeout:
+					return lost
+				case <-ticker.C:
+				}
+			}
+		}
+
 		BeforeEach(func(ctx SpecContext) {
 			var err error
 
@@ -1593,61 +1716,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 			recordContainer(containerID)
 			Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
 
-			// Coordination channels for blocking inside the second plugin's
-			// Synchronize callback. syncOnce guards against the (legal) case of
-			// Synchronize being invoked more than once, which would panic on a
-			// double close of syncReached.
-			syncReached := make(chan struct{})
-			syncRelease := make(chan struct{})
-
-			var syncOnce sync.Once
-
-			configure := func(p *NRITestPlugin) {
-				p.OnSynchronize = func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
-					first := false
-
-					syncOnce.Do(func() { first = true })
-					// Only the first invocation participates in the handshake;
-					// any later one returns immediately so cleanup is not blocked.
-					if !first {
-						return nil
-					}
-
-					close(syncReached)
-
-					select {
-					case <-syncRelease:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
-			}
-
 			By("connecting a second plugin whose Synchronize blocks")
-			// StartNRITestStub blocks until the plugin becomes ready, which only
-			// happens after Synchronize (and thus our blocking hook) returns, so
-			// run it in a goroutine while we drive runtime state from the test.
-			var (
-				secondStub *NRITestStub
-				startErr   error
-				startWg    sync.WaitGroup
-			)
 
-			startWg.Go(func() {
-				secondStub, startErr = StartNRITestStub("cri-test-nri-sync2-second", "10", configure)
-			})
-
-			By("waiting for the second plugin's Synchronize to begin")
-
-			select {
-			case <-syncReached:
-				// Synchronize is now blocking inside our hook.
-			case <-time.After(30 * time.Second):
-				close(syncRelease) // unblock to avoid leaking the goroutine
-				startWg.Wait()
-				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
-			}
+			release, waitReady := startBlockingSyncPlugin("cri-test-nri-sync2-second")
 
 			By("creating a second container while the second plugin's Synchronize is in progress")
 
@@ -1686,11 +1757,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 			time.Sleep(2 * time.Second)
 
 			By("releasing the second plugin's Synchronize")
-			close(syncRelease)
+			release()
 
 			By("waiting for the second plugin to become ready")
-			startWg.Wait()
-			Expect(startErr).NotTo(HaveOccurred(), "second NRI test stub failed to become ready")
+
+			secondStub := waitReady()
 
 			defer secondStub.Cleanup()
 
@@ -1711,42 +1782,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// plugin initialization, but containerd does not yet implement this
 			// guarantee. Poll and Skip rather than hard-failing so the remaining
 			// test suite still runs.
-			pluginSeesContainer := func() bool {
-				if slices.Contains(secondStub.Plugin.SyncedContainers(), createdID) {
-					return true
-				}
-
-				for _, e := range secondStub.Plugin.Events() {
-					if e.Type == EventCreateContainer && e.ContainerID == createdID {
-						return true
-					}
-				}
-
-				return false
-			}
-
-			found := false
-			timeout := time.After(15 * time.Second)
-			ticker := time.NewTicker(100 * time.Millisecond)
-
-			defer ticker.Stop()
-
-		poll:
-			for {
-				if pluginSeesContainer() {
-					found = true
-
-					break
-				}
-
-				select {
-				case <-timeout:
-					break poll
-				case <-ticker.C:
-				}
-			}
-
-			if !found {
+			if lost := pollForLostContainers(secondStub, createdID); len(lost) > 0 {
 				Skip("spec discrepancy: containerd loses containers created while a late-joining " +
 					"plugin's Synchronize is in progress; the NRI spec requires no container is lost " +
 					"during plugin initialization but containerd does not yet implement this guarantee")
@@ -1807,60 +1843,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				beforeIDs = append(beforeIDs, createAndStart("nri-test-sync3-before-"))
 			}
 
-			// Coordination channels for blocking inside the second plugin's
-			// Synchronize callback. syncOnce guards against Synchronize being
-			// invoked more than once, which would panic on a double close.
-			syncReached := make(chan struct{})
-			syncRelease := make(chan struct{})
-
-			var syncOnce sync.Once
-
-			configure := func(p *NRITestPlugin) {
-				p.OnSynchronize = func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
-					first := false
-
-					syncOnce.Do(func() { first = true })
-					// Only the first invocation participates in the handshake;
-					// any later one returns immediately so cleanup is not blocked.
-					if !first {
-						return nil
-					}
-
-					close(syncReached)
-
-					select {
-					case <-syncRelease:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
-			}
-
 			By("connecting a second plugin whose Synchronize blocks")
-			// StartNRITestStub blocks until the plugin becomes ready, which only
-			// happens after Synchronize (and thus our blocking hook) returns, so
-			// run it in a goroutine while we drive runtime state from the test.
-			var (
-				secondStub *NRITestStub
-				startErr   error
-				startWg    sync.WaitGroup
-			)
 
-			startWg.Go(func() {
-				secondStub, startErr = StartNRITestStub("cri-test-nri-sync3-second", "10", configure)
-			})
-
-			By("waiting for the second plugin's Synchronize to begin")
-
-			select {
-			case <-syncReached:
-				// Synchronize is now blocking inside our hook.
-			case <-time.After(30 * time.Second):
-				close(syncRelease) // unblock to avoid leaking the goroutine
-				startWg.Wait()
-				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
-			}
+			release, waitReady := startBlockingSyncPlugin("cri-test-nri-sync3-second")
 
 			By("creating containers DURING the second plugin's Synchronize")
 			// Depending on the runtime, the CRI CreateContainer call may block
@@ -1893,11 +1878,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 			time.Sleep(2 * time.Second)
 
 			By("releasing the second plugin's Synchronize")
-			close(syncRelease)
+			release()
 
 			By("waiting for the second plugin to become ready")
-			startWg.Wait()
-			Expect(startErr).NotTo(HaveOccurred(), "second NRI test stub failed to become ready")
+
+			secondStub := waitReady()
 
 			defer secondStub.Cleanup()
 
@@ -1930,48 +1915,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// is lost during plugin initialization, but containerd does not yet
 			// implement this guarantee under concurrent creation. Poll and Skip
 			// rather than hard-failing so the remaining test suite still runs.
-			pluginSeesContainer := func(id string) bool {
-				if slices.Contains(secondStub.Plugin.SyncedContainers(), id) {
-					return true
-				}
-
-				for _, e := range secondStub.Plugin.Events() {
-					if e.Type == EventCreateContainer && e.ContainerID == id {
-						return true
-					}
-				}
-
-				return false
-			}
-
-			var lostContainers []string
-
-			timeout := time.After(15 * time.Second)
-			ticker := time.NewTicker(100 * time.Millisecond)
-
-			defer ticker.Stop()
-
-		poll:
-			for {
-				lostContainers = nil
-
-				for _, id := range allIDs {
-					if !pluginSeesContainer(id) {
-						lostContainers = append(lostContainers, id)
-					}
-				}
-
-				if len(lostContainers) == 0 {
-					break
-				}
-
-				select {
-				case <-timeout:
-					break poll
-				case <-ticker.C:
-				}
-			}
-
+			lostContainers := pollForLostContainers(secondStub, allIDs...)
 			if len(lostContainers) > 0 {
 				Skip(fmt.Sprintf("spec discrepancy: containerd lost %d container(s) created "+
 					"concurrently around a late-joining plugin's Synchronize window (%v); "+
