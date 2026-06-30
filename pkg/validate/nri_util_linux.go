@@ -244,6 +244,8 @@ func (p *NRITestPlugin) Reset() {
 	defer p.mu.Unlock()
 
 	p.events = nil
+	p.syncPods = nil
+	p.syncContainers = nil
 }
 
 // LastRunPodSandboxID returns the pod sandbox ID from the most recent RunPodSandbox event,
