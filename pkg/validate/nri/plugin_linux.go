@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -263,15 +264,23 @@ func (p *NRITestPlugin) Reset() {
 	p.syncContainers = nil
 }
 
-// LastRunPodSandboxID returns the pod sandbox ID from the most recent RunPodSandbox event,
-// or empty string if none recorded. This is useful for cleanup in AfterEach when the test
-// may have failed before capturing the pod ID from the CRI call.
-func (p *NRITestPlugin) LastRunPodSandboxID() string {
+// LastRunPodSandboxID returns the pod sandbox ID from the most recent RunPodSandbox
+// event whose pod name starts with namePrefix, or empty string if none recorded.
+// This is useful for cleanup in AfterEach when the test may have failed before
+// capturing the pod ID from the CRI call.
+//
+// The prefix is required rather than optional: the plugin observes every sandbox the
+// runtime reports while the stub is connected, including sandboxes created by other
+// actors on the node (a kubelet, say). Callers use the returned ID for destructive
+// cleanup or leak assertions, so an unscoped "most recent" lookup could remove or
+// fail on a sandbox this suite never created.
+func (p *NRITestPlugin) LastRunPodSandboxID(namePrefix string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for i := range slices.Backward(p.events) {
-		if p.events[i].Type == EventRunPodSandbox {
+		if p.events[i].Type == EventRunPodSandbox &&
+			strings.HasPrefix(p.events[i].PodName, namePrefix) {
 			return p.events[i].PodSandboxID
 		}
 	}
