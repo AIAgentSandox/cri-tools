@@ -53,6 +53,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// containerID holds the successfully created retry container so
 			// AfterEach can remove it even if an inline assertion fails.
 			containerID string
+			// joinInFlightCreate is set by specs that leave a CreateContainer
+			// blocked in a goroutine. AfterEach calls it to release the hook,
+			// join the goroutine and publish the resulting container ID, so an
+			// aborted spec cannot leave a half-created container behind.
+			joinInFlightCreate func()
 		)
 
 		BeforeEach(func(ctx SpecContext) {
@@ -91,7 +96,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			// Stop the stub first so a still-failing hook cannot interfere with
+			// Release and join any CreateContainer still blocked in a goroutine
+			// before touching the stub, so the runtime is never finishing a
+			// container creation while we tear the sandbox down.
+			if joinInFlightCreate != nil {
+				joinInFlightCreate()
+			}
+
+			// Stop the stub next so a still-failing hook cannot interfere with
 			// teardown of the container or sandbox.
 			if testStub != nil {
 				testStub.Cleanup()
@@ -120,6 +132,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// Reset the Context-scoped state so the next spec never inherits an
 			// already-removed ID or a stopped stub from this one.
 			testStub, podID, containerID = nil, "", ""
+			joinInFlightCreate = nil
 		})
 
 		It(
@@ -184,10 +197,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				sandboxID := podID
 
 				var (
-					createErr error
-					createdID string
-					createWg  sync.WaitGroup
+					createErr   error
+					createdID   string
+					createWg    sync.WaitGroup
+					releaseOnce sync.Once
 				)
+
+				// releaseHook is idempotent so the timeout path, the success
+				// path and AfterEach can all unblock the hook safely.
+				releaseHook := func() { releaseOnce.Do(func() { close(hookBlocking) }) }
 
 				createWg.Go(func() {
 					createdID, createErr = rc.CreateContainer(
@@ -198,15 +216,35 @@ var _ = framework.KubeDescribe("NRI", func() {
 					)
 				})
 
+				// An assertion failure below unwinds straight to AfterEach without
+				// joining this goroutine, so hand AfterEach a way to release the
+				// hook, wait for CreateContainer to return and publish whatever
+				// container it produced for removal.
+				joinInFlightCreate = func() {
+					releaseHook()
+					createWg.Wait()
+
+					if containerID == "" && createdID != "" {
+						containerID = createdID
+					}
+				}
+
 				By("waiting for CreateContainer hook to be reached")
 
 				select {
 				case <-hookReached:
 					// Hook is now blocking
 				case <-time.After(30 * time.Second):
-					close(hookBlocking) // unblock to avoid goroutine leak
+					releaseHook() // unblock to avoid goroutine leak
 					Fail("Timed out waiting for CreateContainer NRI hook to fire")
 				}
+
+				// The runtime has already assigned the container its final ID by
+				// the time the hook fires, so publish it for cleanup before any
+				// assertion below can abort the spec: once the hook is released
+				// the runtime completes the creation whether or not we get to
+				// read the ID that CreateContainer returns.
+				containerID = hookContainerID
 
 				// Without a container ID from the hook the checks below would pass
 				// vacuously, so fail loudly instead of silently verifying nothing.
@@ -236,7 +274,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				By("releasing the hook and verifying container is created")
-				close(hookBlocking)
+				releaseHook()
 				createWg.Wait()
 				Expect(
 					createErr,
