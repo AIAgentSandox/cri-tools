@@ -67,6 +67,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 			if testStub != nil {
 				testStub.Cleanup()
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed sandbox ID or a stopped stub from this one.
+			testStub, podID = nil, ""
 		})
 
 		It(
