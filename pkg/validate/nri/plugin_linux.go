@@ -70,18 +70,100 @@ type NRITestPlugin struct {
 	// Hook callbacks - if set, called during the respective hook.
 	// Return an error to simulate plugin failure.
 	//
-	// OnSynchronize fires during the Synchronize handshake (before the ready
+	// These are guarded by mu and must only be installed through the SetOn...
+	// setters: the stub's request handler goroutine is already live once
+	// StartNRITestStub returns, and the runtime may deliver a callback for a
+	// sandbox created by another actor on the node at any moment, so a plain
+	// field assignment from the spec goroutine races with the handler's read.
+	//
+	// onSynchronize fires during the Synchronize handshake (before the ready
 	// channel is closed), so it must be installed before the stub connects
 	// (see the configure callback on StartNRITestStub). Block inside it to hold
 	// the Synchronize call open while the test mutates runtime state.
-	OnSynchronize      func(ctx context.Context, pods []*nri.PodSandbox, containers []*nri.Container) error
-	OnRunPodSandbox    func(ctx context.Context, pod *nri.PodSandbox) error
-	OnStopPodSandbox   func(ctx context.Context, pod *nri.PodSandbox) error
-	OnRemovePodSandbox func(ctx context.Context, pod *nri.PodSandbox) error
-	OnCreateContainer  func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
-	OnStartContainer   func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
-	OnStopContainer    func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
-	OnRemoveContainer  func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
+	onSynchronize      SyncHook
+	onRunPodSandbox    PodHook
+	onStopPodSandbox   PodHook
+	onRemovePodSandbox PodHook
+	onCreateContainer  ContainerHook
+	onStartContainer   ContainerHook
+	onStopContainer    ContainerHook
+	onRemoveContainer  ContainerHook
+}
+
+// Hook callback signatures. Returning an error simulates a plugin failure.
+type (
+	// SyncHook fires during the Synchronize handshake.
+	SyncHook func(ctx context.Context, pods []*nri.PodSandbox, containers []*nri.Container) error
+	// PodHook fires during a pod sandbox lifecycle hook.
+	PodHook func(ctx context.Context, pod *nri.PodSandbox) error
+	// ContainerHook fires during a container lifecycle hook.
+	ContainerHook func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
+)
+
+// SetOnSynchronize installs the Synchronize hook. It only has an effect when
+// called before the stub connects, i.e. from a StartNRITestStub configure
+// callback.
+func (p *NRITestPlugin) SetOnSynchronize(hook SyncHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onSynchronize = hook
+}
+
+// SetOnRunPodSandbox installs the RunPodSandbox hook.
+func (p *NRITestPlugin) SetOnRunPodSandbox(hook PodHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onRunPodSandbox = hook
+}
+
+// SetOnStopPodSandbox installs the StopPodSandbox hook.
+func (p *NRITestPlugin) SetOnStopPodSandbox(hook PodHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onStopPodSandbox = hook
+}
+
+// SetOnRemovePodSandbox installs the RemovePodSandbox hook.
+func (p *NRITestPlugin) SetOnRemovePodSandbox(hook PodHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onRemovePodSandbox = hook
+}
+
+// SetOnCreateContainer installs the CreateContainer hook.
+func (p *NRITestPlugin) SetOnCreateContainer(hook ContainerHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onCreateContainer = hook
+}
+
+// SetOnStartContainer installs the StartContainer hook.
+func (p *NRITestPlugin) SetOnStartContainer(hook ContainerHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onStartContainer = hook
+}
+
+// SetOnStopContainer installs the StopContainer hook.
+func (p *NRITestPlugin) SetOnStopContainer(hook ContainerHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onStopContainer = hook
+}
+
+// SetOnRemoveContainer installs the RemoveContainer hook.
+func (p *NRITestPlugin) SetOnRemoveContainer(hook ContainerHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.onRemoveContainer = hook
 }
 
 // Synchronize implements stub.SynchronizeInterface.
@@ -105,6 +187,8 @@ func (p *NRITestPlugin) Synchronize(
 		p.syncContainers = append(p.syncContainers, container.GetId())
 	}
 
+	hook := p.onSynchronize
+
 	p.mu.Unlock()
 
 	// Invoke the optional hook while still inside the Synchronize call. A test
@@ -112,8 +196,8 @@ func (p *NRITestPlugin) Synchronize(
 	// window (the runtime has not yet observed the plugin as ready) while it
 	// creates additional containers, exercising the race where a container
 	// created during Synchronize must not be lost.
-	if p.OnSynchronize != nil {
-		if err := p.OnSynchronize(ctx, pods, containers); err != nil {
+	if hook != nil {
+		if err := hook(ctx, pods, containers); err != nil {
 			return nil, err
 		}
 	}
@@ -149,8 +233,9 @@ func (p *NRITestPlugin) SyncedContainers() []string {
 func (p *NRITestPlugin) RunPodSandbox(ctx context.Context, pod *nri.PodSandbox) error {
 	p.recordPodEvent(EventRunPodSandbox, pod)
 
-	if p.OnRunPodSandbox != nil {
-		return p.OnRunPodSandbox(ctx, pod)
+	hook := p.onRunPodSandboxHook()
+	if hook != nil {
+		return hook(ctx, pod)
 	}
 
 	return nil
@@ -160,8 +245,9 @@ func (p *NRITestPlugin) RunPodSandbox(ctx context.Context, pod *nri.PodSandbox) 
 func (p *NRITestPlugin) StopPodSandbox(ctx context.Context, pod *nri.PodSandbox) error {
 	p.recordPodEvent(EventStopPodSandbox, pod)
 
-	if p.OnStopPodSandbox != nil {
-		return p.OnStopPodSandbox(ctx, pod)
+	hook := p.onStopPodSandboxHook()
+	if hook != nil {
+		return hook(ctx, pod)
 	}
 
 	return nil
@@ -171,8 +257,9 @@ func (p *NRITestPlugin) StopPodSandbox(ctx context.Context, pod *nri.PodSandbox)
 func (p *NRITestPlugin) RemovePodSandbox(ctx context.Context, pod *nri.PodSandbox) error {
 	p.recordPodEvent(EventRemovePodSandbox, pod)
 
-	if p.OnRemovePodSandbox != nil {
-		return p.OnRemovePodSandbox(ctx, pod)
+	hook := p.onRemovePodSandboxHook()
+	if hook != nil {
+		return hook(ctx, pod)
 	}
 
 	return nil
@@ -186,8 +273,9 @@ func (p *NRITestPlugin) CreateContainer(
 ) (*nri.ContainerAdjustment, []*nri.ContainerUpdate, error) {
 	p.recordContainerEvent(EventCreateContainer, pod, container)
 
-	if p.OnCreateContainer != nil {
-		if err := p.OnCreateContainer(ctx, pod, container); err != nil {
+	hook := p.onCreateContainerHook()
+	if hook != nil {
+		if err := hook(ctx, pod, container); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -203,8 +291,9 @@ func (p *NRITestPlugin) StartContainer(
 ) error {
 	p.recordContainerEvent(EventStartContainer, pod, container)
 
-	if p.OnStartContainer != nil {
-		return p.OnStartContainer(ctx, pod, container)
+	hook := p.onStartContainerHook()
+	if hook != nil {
+		return hook(ctx, pod, container)
 	}
 
 	return nil
@@ -218,8 +307,9 @@ func (p *NRITestPlugin) StopContainer(
 ) ([]*nri.ContainerUpdate, error) {
 	p.recordContainerEvent(EventStopContainer, pod, container)
 
-	if p.OnStopContainer != nil {
-		if err := p.OnStopContainer(ctx, pod, container); err != nil {
+	hook := p.onStopContainerHook()
+	if hook != nil {
+		if err := hook(ctx, pod, container); err != nil {
 			return nil, err
 		}
 	}
@@ -235,8 +325,9 @@ func (p *NRITestPlugin) RemoveContainer(
 ) error {
 	p.recordContainerEvent(EventRemoveContainer, pod, container)
 
-	if p.OnRemoveContainer != nil {
-		return p.OnRemoveContainer(ctx, pod, container)
+	hook := p.onRemoveContainerHook()
+	if hook != nil {
+		return hook(ctx, pod, container)
 	}
 
 	return nil
@@ -298,6 +389,59 @@ func FilterEventsByPodID(events []NRIEvent, podID string) []NRIEvent {
 	}
 
 	return filtered
+}
+
+// The on...Hook accessors read the installed hook under mu, so the request
+// handler goroutine never races with a spec installing a hook. The hook itself
+// is invoked after the lock is released: hooks block for the duration of a test
+// handshake, and holding mu across one would deadlock event recording.
+func (p *NRITestPlugin) onRunPodSandboxHook() PodHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onRunPodSandbox
+}
+
+func (p *NRITestPlugin) onStopPodSandboxHook() PodHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onStopPodSandbox
+}
+
+func (p *NRITestPlugin) onRemovePodSandboxHook() PodHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onRemovePodSandbox
+}
+
+func (p *NRITestPlugin) onCreateContainerHook() ContainerHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onCreateContainer
+}
+
+func (p *NRITestPlugin) onStartContainerHook() ContainerHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onStartContainer
+}
+
+func (p *NRITestPlugin) onStopContainerHook() ContainerHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onStopContainer
+}
+
+func (p *NRITestPlugin) onRemoveContainerHook() ContainerHook {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.onRemoveContainer
 }
 
 func (p *NRITestPlugin) recordPodEvent(eventType NRIEventType, pod *nri.PodSandbox) {

@@ -116,26 +116,28 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// sync.Once guards against the hook being invoked multiple times
 				// (e.g., idempotent stop redelivery), which would otherwise panic
 				// on a double close of hookReached.
-				testStub.Plugin.OnStopPodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
-					firstInvocation := false
+				testStub.Plugin.SetOnStopPodSandbox(
+					func(hookCtx context.Context, _ *nri.PodSandbox) error {
+						firstInvocation := false
 
-					hookOnce.Do(func() { firstInvocation = true })
+						hookOnce.Do(func() { firstInvocation = true })
 
-					// Skip duplicate invocations (e.g., AfterEach cleanup) so
-					// they are not blocked by the test channel handshake.
-					if !firstInvocation {
+						// Skip duplicate invocations (e.g., AfterEach cleanup) so
+						// they are not blocked by the test channel handshake.
+						if !firstInvocation {
+							return nil
+						}
+
+						close(hookReached)
+
+						select {
+						case <-hookBlocking:
+						case <-hookCtx.Done():
+						}
+
 						return nil
-					}
-
-					close(hookReached)
-
-					select {
-					case <-hookBlocking:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
+					},
+				)
 
 				By("creating a pod sandbox")
 
@@ -257,7 +259,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("releasing the hook and verifying StopPodSandbox succeeds")
 				releaseHook()
 				stopWg.Wait()
+
 				joinInFlightStop = nil
+
 				Expect(
 					stopErr,
 				).NotTo(HaveOccurred(), "StopPodSandbox should succeed after hook returns")

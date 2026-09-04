@@ -92,25 +92,27 @@ var _ = framework.KubeDescribe("NRI", func() {
 			var syncOnce sync.Once
 
 			configure := func(p *NRITestPlugin) {
-				p.OnSynchronize = func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
-					first := false
+				p.SetOnSynchronize(
+					func(hookCtx context.Context, _ []*nri.PodSandbox, _ []*nri.Container) error {
+						first := false
 
-					syncOnce.Do(func() { first = true })
-					// Only the first invocation participates in the handshake;
-					// any later one returns immediately so cleanup is not blocked.
-					if !first {
+						syncOnce.Do(func() { first = true })
+						// Only the first invocation participates in the handshake;
+						// any later one returns immediately so cleanup is not blocked.
+						if !first {
+							return nil
+						}
+
+						close(syncReached)
+
+						select {
+						case <-syncRelease:
+						case <-hookCtx.Done():
+						}
+
 						return nil
-					}
-
-					close(syncReached)
-
-					select {
-					case <-syncRelease:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
+					},
+				)
 			}
 
 			// StartNRITestStub blocks until the plugin becomes ready, which only
