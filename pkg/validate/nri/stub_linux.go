@@ -106,7 +106,13 @@ func StartNRITestStub(
 	case <-done:
 		cancel()
 
-		return nil, fmt.Errorf("NRI stub exited early: %w", <-errCh)
+		// s.Run returns nil when the stub's server closes cleanly, so guard the
+		// %w verb: wrapping a nil error renders as "%!w(<nil>)".
+		if runErr := <-errCh; runErr != nil {
+			return nil, fmt.Errorf("NRI stub exited early: %w", runErr)
+		}
+
+		return nil, errors.New("NRI stub exited before becoming ready")
 	case <-plugin.ready:
 		// Registration and configuration complete
 	case <-time.After(10 * time.Second):
@@ -116,7 +122,11 @@ func StartNRITestStub(
 		select {
 		case <-done:
 			// Goroutine finished; safe to read the error.
-			return nil, fmt.Errorf("NRI stub did not become ready within 10s: %w", <-errCh)
+			if runErr := <-errCh; runErr != nil {
+				return nil, fmt.Errorf("NRI stub did not become ready within 10s: %w", runErr)
+			}
+
+			return nil, errors.New("NRI stub exited within 10s without becoming ready")
 		case <-time.After(5 * time.Second):
 			// Goroutine still running — likely stuck in Start()'s <-cfgErrC read,
 			// which does not observe context cancellation. Force-close the
