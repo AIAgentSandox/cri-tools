@@ -41,6 +41,11 @@ func nriTestClients(
 }
 
 // getContainerStatus returns the status of the container.
+//
+// This mirrors the identically named helper in pkg/validate, which stays
+// unexported there. Keeping a local copy is deliberate: exporting it would
+// require rewriting its ~40 call sites in pkg/validate for the sake of eight
+// lines that only wrap ContainerStatus.
 func getContainerStatus(
 	ctx context.Context,
 	c internalapi.RuntimeService,

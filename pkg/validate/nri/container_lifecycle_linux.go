@@ -156,11 +156,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 					err,
 				).NotTo(HaveOccurred(), "NRI stub did not receive all container lifecycle events")
 
-				// Filter for container events (those with a ContainerID set)
+				// Filter for events belonging to the container this spec created.
+				// Matching on "any non-empty ContainerID" would let events from an
+				// unrelated container (e.g. leaked by an earlier spec or created
+				// concurrently on the node) satisfy the assertions below.
 				var containerEvents []NRIEvent
 
 				for i := range events {
-					if events[i].ContainerID != "" {
+					if events[i].ContainerID == containerID {
 						containerEvents = append(containerEvents, events[i])
 					}
 				}

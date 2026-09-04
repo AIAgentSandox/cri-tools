@@ -77,6 +77,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
 				}
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed ID or a stopped stub from this one.
+			testStub, podID, containerID = nil, "", ""
 		})
 
 		It(
