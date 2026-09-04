@@ -116,6 +116,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
 				}
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed ID or a stopped stub from this one.
+			testStub, podID, containerID = nil, "", ""
 		})
 
 		It(
@@ -129,7 +133,22 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				var hookContainerID string
 
+				var hookOnce sync.Once
+
+				// sync.Once guards against the hook being invoked more than
+				// once, which would otherwise panic on a double close of
+				// hookReached and race on hookContainerID.
 				testStub.Plugin.OnCreateContainer = func(hookCtx context.Context, _ *nri.PodSandbox, container *nri.Container) error {
+					firstInvocation := false
+
+					hookOnce.Do(func() { firstInvocation = true })
+
+					// Skip duplicate invocations so they are not blocked by the
+					// test channel handshake.
+					if !firstInvocation {
+						return nil
+					}
+
 					hookContainerID = container.GetId()
 
 					close(hookReached)
@@ -183,6 +202,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Fail("Timed out waiting for CreateContainer NRI hook to fire")
 				}
 
+				// Without a container ID from the hook the checks below would pass
+				// vacuously, so fail loudly instead of silently verifying nothing.
+				Expect(hookContainerID).NotTo(BeEmpty(),
+					"CreateContainer hook MUST receive a container with a non-empty ID")
+
 				By("verifying container is NOT listed while hook is blocking")
 
 				containers, listErr := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
@@ -197,14 +221,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("verifying ContainerStatus is not accessible while hook is blocking")
 
-				if hookContainerID != "" {
-					statusResp, statusErr := rc.ContainerStatus(ctx, hookContainerID, false)
-					if statusErr == nil && statusResp != nil && statusResp.GetStatus() != nil {
-						Expect(
-							statusResp.GetStatus().GetState(),
-						).NotTo(Equal(runtimeapi.ContainerState_CONTAINER_CREATED),
-							"Container MUST NOT report CREATED state while CreateContainer hook is in progress")
-					}
+				blockedResp, blockedErr := rc.ContainerStatus(ctx, hookContainerID, false)
+				if blockedErr == nil && blockedResp != nil && blockedResp.GetStatus() != nil {
+					Expect(
+						blockedResp.GetStatus().GetState(),
+					).NotTo(Equal(runtimeapi.ContainerState_CONTAINER_CREATED),
+						"Container MUST NOT report CREATED state while CreateContainer hook is in progress")
 				}
 
 				By("releasing the hook and verifying container is created")

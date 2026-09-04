@@ -129,6 +129,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 			case <-time.After(30 * time.Second):
 				release() // unblock to avoid leaking the goroutine
 				startWg.Wait()
+
+				// The caller registers its own cleanup only once waitReady
+				// returns, which never happens on this path, so disconnect the
+				// stub here. Otherwise it stays registered with the runtime and
+				// keeps receiving callbacks for the rest of the suite.
+				if stub != nil {
+					stub.Cleanup()
+				}
+
 				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
 			}
 
@@ -242,6 +251,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 			if firstStub != nil {
 				firstStub.Cleanup()
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed ID or a stopped stub from this one.
+			firstStub, podID = nil, ""
+
+			createdMu.Lock()
+			createdContainers = nil
+			createdMu.Unlock()
 		})
 
 		It(
