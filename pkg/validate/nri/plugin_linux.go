@@ -18,7 +18,6 @@ package nri
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -286,36 +285,6 @@ func (p *NRITestPlugin) LastRunPodSandboxID(namePrefix string) string {
 	}
 
 	return ""
-}
-
-// WaitForEventCount waits until at least count events are recorded, or times out.
-func (p *NRITestPlugin) WaitForEventCount(count int, timeout time.Duration) ([]NRIEvent, error) {
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		p.mu.Lock()
-
-		if len(p.events) >= count {
-			result := make([]NRIEvent, len(p.events))
-			copy(result, p.events)
-			p.mu.Unlock()
-
-			return result, nil
-		}
-
-		p.mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return nil, fmt.Errorf(
-		"timed out waiting for %d NRI events after %v (got %d)",
-		count,
-		timeout,
-		len(p.events),
-	)
 }
 
 // FilterEventsByPodID returns events matching a specific pod sandbox ID.

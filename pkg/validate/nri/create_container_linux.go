@@ -343,11 +343,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("verifying the NRI CreateContainer hook actually fired")
 				// The hook records its event before returning the error, confirming
-				// the failure was induced on the creation path as intended.
+				// the failure was induced on the creation path as intended. Scope the
+				// count to this spec's sandbox: the plugin also observes containers
+				// created concurrently on the node, and an unrelated CreateContainer
+				// would satisfy this assertion vacuously.
 				Eventually(func() int {
 					count := 0
 
-					for _, e := range testStub.Plugin.Events() {
+					for _, e := range FilterEventsByPodID(testStub.Plugin.Events(), podID) {
 						if e.Type == EventCreateContainer {
 							count++
 						}
@@ -381,11 +384,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// The runtime may emit Stop/Remove events as part of internal cleanup
 				// of the partially created container, but a StartContainer event must
 				// never appear. Use Consistently so events delivered slightly after the
-				// failure are still caught.
+				// failure are still caught, and scope the count to this spec's sandbox
+				// so a container started elsewhere on the node cannot fail the spec.
 				Consistently(func() int {
 					count := 0
 
-					for _, e := range testStub.Plugin.Events() {
+					for _, e := range FilterEventsByPodID(testStub.Plugin.Events(), podID) {
 						if e.Type == EventStartContainer {
 							count++
 						}
