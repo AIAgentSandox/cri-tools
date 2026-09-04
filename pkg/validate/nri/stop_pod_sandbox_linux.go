@@ -49,9 +49,20 @@ var _ = framework.KubeDescribe("NRI", func() {
 			podID       string
 			podConfig   *runtimeapi.PodSandboxConfig
 			containerID string
+			// joinInFlightStop is set by specs that leave a StopPodSandbox
+			// blocked in a goroutine. AfterEach calls it to release the hook and
+			// join the goroutine, so the cleanup below never issues its own
+			// stop/remove calls concurrently with an outstanding one.
+			joinInFlightStop func()
 		)
 
 		AfterEach(func(ctx SpecContext) {
+			// Release and join any StopPodSandbox left in flight by a spec that
+			// aborted between the hook handshake and its own Wait().
+			if joinInFlightStop != nil {
+				joinInFlightStop()
+			}
+
 			// Stop the stub first to unblock any hooks that may be holding
 			// a StopPodSandbox call, allowing it to complete.
 			if testStub != nil {
@@ -79,8 +90,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 
 			// Reset the Context-scoped state so the next spec never inherits an
-			// already-removed ID or a stopped stub from this one.
-			testStub, podID, containerID = nil, "", ""
+			// already-removed ID, a stopped stub or a stale join from this one.
+			testStub, podID, containerID, joinInFlightStop = nil, "", "", nil
 		})
 
 		It(
@@ -186,13 +197,27 @@ var _ = framework.KubeDescribe("NRI", func() {
 				sandboxID := podID
 
 				var (
-					stopErr error
-					stopWg  sync.WaitGroup
+					stopErr     error
+					stopWg      sync.WaitGroup
+					releaseOnce sync.Once
 				)
+
+				// releaseHook is idempotent so the timeout path, the success path
+				// and AfterEach can all unblock the hook safely.
+				releaseHook := func() { releaseOnce.Do(func() { close(hookBlocking) }) }
 
 				stopWg.Go(func() {
 					stopErr = rc.StopPodSandbox(ctx, sandboxID)
 				})
+
+				// An assertion failure below unwinds straight to AfterEach without
+				// joining this goroutine, so hand AfterEach a way to release the
+				// hook and wait for StopPodSandbox to return before it issues its
+				// own stop/remove calls against the same sandbox.
+				joinInFlightStop = func() {
+					releaseHook()
+					stopWg.Wait()
+				}
 
 				By("waiting for StopPodSandbox hook to be reached")
 
@@ -200,7 +225,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				case <-hookReached:
 					// Hook is now blocking; main goroutine can inspect state
 				case <-time.After(30 * time.Second):
-					close(hookBlocking) // unblock to avoid goroutine leak
+					releaseHook() // unblock to avoid goroutine leak
 					Fail("Timed out waiting for StopPodSandbox NRI hook to fire")
 				}
 
@@ -230,8 +255,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(statusResp.GetStatus().GetId()).To(Equal(podID))
 
 				By("releasing the hook and verifying StopPodSandbox succeeds")
-				close(hookBlocking)
+				releaseHook()
 				stopWg.Wait()
+				joinInFlightStop = nil
 				Expect(
 					stopErr,
 				).NotTo(HaveOccurred(), "StopPodSandbox should succeed after hook returns")
