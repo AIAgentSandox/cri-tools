@@ -50,9 +50,23 @@ var _ = framework.KubeDescribe("NRI", func() {
 			testStub  *NRITestStub
 			podID     string
 			podConfig *runtimeapi.PodSandboxConfig
+			// joinInFlightRun is set by specs that leave a RunPodSandbox
+			// blocked in a goroutine. AfterEach calls it to release the hook and
+			// join the goroutine, so the cleanup below never issues its
+			// stop/remove calls concurrently with a sandbox that is still being
+			// created.
+			joinInFlightRun func()
 		)
 
 		AfterEach(func(ctx SpecContext) {
+			// Release and join any RunPodSandbox left in flight by a spec that
+			// aborted between the hook handshake and its own Wait(). This must
+			// happen before the IDs are collected below so the sandbox is fully
+			// created by the time it is stopped and removed.
+			if joinInFlightRun != nil {
+				joinInFlightRun()
+			}
+
 			// Capture the sandbox IDs to clean up before the stub is stopped
 			// and its recorded events are dropped. A spec that fails before
 			// assigning podID still leaks the sandbox its goroutine created, so
@@ -92,7 +106,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// already-removed sandbox ID or a stopped stub from this one.
 			// podConfig is deliberately left alone: a spec that timed out may
 			// still have a RunPodSandbox goroutine reading it.
-			testStub, podID = nil, ""
+			testStub, podID, joinInFlightRun = nil, "", nil
 		})
 
 		It(
@@ -161,10 +175,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				var (
-					runErr   error
-					runPodID string
-					runWg    sync.WaitGroup
+					runErr      error
+					runPodID    string
+					runWg       sync.WaitGroup
+					releaseOnce sync.Once
 				)
+
+				// releaseHook is idempotent so the timeout path, the success path
+				// and AfterEach can all unblock the hook safely.
+				releaseHook := func() { releaseOnce.Do(func() { close(hookBlocking) }) }
 
 				runWg.Go(func() {
 					runPodID, runErr = rc.RunPodSandbox(
@@ -174,13 +193,22 @@ var _ = framework.KubeDescribe("NRI", func() {
 					)
 				})
 
+				// An assertion failure below unwinds straight to AfterEach without
+				// joining this goroutine, so hand AfterEach a way to release the
+				// hook and wait for RunPodSandbox to return before it issues its
+				// stop/remove calls against the sandbox being created.
+				joinInFlightRun = func() {
+					releaseHook()
+					runWg.Wait()
+				}
+
 				By("waiting for RunPodSandbox hook to be reached")
 
 				select {
 				case <-hookReached:
 					// Hook is now blocking
 				case <-time.After(30 * time.Second):
-					close(hookBlocking) // unblock to avoid goroutine leak
+					releaseHook() // unblock to avoid goroutine leak
 					Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
 				}
 
@@ -220,8 +248,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				By("releasing the hook and verifying pod becomes Ready")
-				close(hookBlocking)
+				releaseHook()
 				runWg.Wait()
+				joinInFlightRun = nil
 				Expect(
 					runErr,
 				).NotTo(HaveOccurred(), "RunPodSandbox should succeed after hook returns")
@@ -311,10 +340,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				var (
-					runErr   error
-					runPodID string
-					runWg    sync.WaitGroup
+					runErr      error
+					runPodID    string
+					runWg       sync.WaitGroup
+					releaseOnce sync.Once
 				)
+
+				// releaseHook is idempotent so the timeout path, the success path
+				// and AfterEach can all unblock the hook safely.
+				releaseHook := func() { releaseOnce.Do(func() { close(hookBlocking) }) }
 
 				runWg.Go(func() {
 					runPodID, runErr = rc.RunPodSandbox(
@@ -324,13 +358,22 @@ var _ = framework.KubeDescribe("NRI", func() {
 					)
 				})
 
+				// An assertion failure below unwinds straight to AfterEach without
+				// joining this goroutine, so hand AfterEach a way to release the
+				// hook and wait for RunPodSandbox to return before it issues its
+				// stop/remove calls against the sandbox being created.
+				joinInFlightRun = func() {
+					releaseHook()
+					runWg.Wait()
+				}
+
 				By("waiting for RunPodSandbox hook to be reached")
 
 				select {
 				case <-hookReached:
 					// Hook is now blocking
 				case <-time.After(30 * time.Second):
-					close(hookBlocking)
+					releaseHook()
 					Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
 				}
 
@@ -369,8 +412,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 					"No container ID should be returned when creation fails")
 
 				By("releasing the hook and verifying pod becomes Ready")
-				close(hookBlocking)
+				releaseHook()
 				runWg.Wait()
+				joinInFlightRun = nil
 				Expect(
 					runErr,
 				).NotTo(HaveOccurred(), "RunPodSandbox should succeed after hook returns")
