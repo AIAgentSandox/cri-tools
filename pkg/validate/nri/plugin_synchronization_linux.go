@@ -472,6 +472,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Linux:   &runtimeapi.LinuxContainerConfig{},
 				}
 
+				// Capture the sandbox ID before launching the goroutine. An
+				// assertion failure between here and the Wait() below aborts the
+				// spec without joining, so AfterEach can reset podID while this
+				// goroutine is still reading it.
+				sandboxID := podID
+
 				// Create the second container in a goroutine: depending on the
 				// runtime, the CRI CreateContainer call may block until the
 				// in-progress Synchronize returns, so it must not block the test.
@@ -488,7 +494,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 						rc,
 						ic,
 						secondContainerConfig,
-						podID,
+						sandboxID,
 						podConfig,
 					)
 					Expect(id).NotTo(BeEmpty())
@@ -573,6 +579,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
 
+				// Capture the sandbox ID for createAndStart, which runs in
+				// goroutines that a failing assertion can leave unjoined while
+				// AfterEach resets podID.
+				sandboxID := podID
+
 				// createAndStart creates and starts a container in the sandbox,
 				// records it for cleanup, and returns its ID.
 				createAndStart := func(namePrefix string) string {
@@ -589,7 +600,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 						Linux:   &runtimeapi.LinuxContainerConfig{},
 					}
 
-					id := framework.CreateContainer(ctx, rc, ic, containerConfig, podID, podConfig)
+					id := framework.CreateContainer(
+						ctx,
+						rc,
+						ic,
+						containerConfig,
+						sandboxID,
+						podConfig,
+					)
 					Expect(id).NotTo(BeEmpty())
 					// Record the ID before starting so AfterEach can clean the
 					// container up even if StartContainer fails or times out.
