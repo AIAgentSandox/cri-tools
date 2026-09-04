@@ -151,28 +151,30 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// sync.Once guards against the hook being invoked more than
 				// once, which would otherwise panic on a double close of
 				// hookReached and race on hookContainerID.
-				testStub.Plugin.OnCreateContainer = func(hookCtx context.Context, _ *nri.PodSandbox, container *nri.Container) error {
-					firstInvocation := false
+				testStub.Plugin.SetOnCreateContainer(
+					func(hookCtx context.Context, _ *nri.PodSandbox, container *nri.Container) error {
+						firstInvocation := false
 
-					hookOnce.Do(func() { firstInvocation = true })
+						hookOnce.Do(func() { firstInvocation = true })
 
-					// Skip duplicate invocations so they are not blocked by the
-					// test channel handshake.
-					if !firstInvocation {
+						// Skip duplicate invocations so they are not blocked by the
+						// test channel handshake.
+						if !firstInvocation {
+							return nil
+						}
+
+						hookContainerID = container.GetId()
+
+						close(hookReached)
+
+						select {
+						case <-hookBlocking:
+						case <-hookCtx.Done():
+						}
+
 						return nil
-					}
-
-					hookContainerID = container.GetId()
-
-					close(hookReached)
-
-					select {
-					case <-hookBlocking:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
+					},
+				)
 
 				By("triggering CreateContainer in a goroutine")
 
@@ -276,6 +278,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("releasing the hook and verifying container is created")
 				releaseHook()
 				createWg.Wait()
+
+				joinInFlightCreate = nil
+
 				Expect(
 					createErr,
 				).NotTo(HaveOccurred(), "CreateContainer should succeed after hook returns")
@@ -298,17 +303,19 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// Fail only the first CreateContainer invocation so the retry passes.
 				var failOnce sync.Once
 
-				testStub.Plugin.OnCreateContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
-					shouldFail := false
+				testStub.Plugin.SetOnCreateContainer(
+					func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
+						shouldFail := false
 
-					failOnce.Do(func() { shouldFail = true })
+						failOnce.Do(func() { shouldFail = true })
 
-					if shouldFail {
-						return errors.New("induced NRI CreateContainer failure")
-					}
+						if shouldFail {
+							return errors.New("induced NRI CreateContainer failure")
+						}
 
-					return nil
-				}
+						return nil
+					},
+				)
 
 				// Reset events so we only observe container events from this point.
 				testStub.Plugin.Reset()
