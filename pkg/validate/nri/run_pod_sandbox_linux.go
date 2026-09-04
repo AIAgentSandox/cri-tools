@@ -57,15 +57,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// and its recorded events are dropped. A spec that fails before
 			// assigning podID still leaks the sandbox its goroutine created, so
 			// the stub's last observed RunPodSandbox ID is always collected as
-			// well rather than only as a fallback.
+			// well rather than only as a fallback. The lookup is scoped to this
+			// suite's pod name prefix so cleanup can never stop and remove a
+			// sandbox that some other actor on the node created meanwhile.
 			cleanupIDs := []string{}
 			if podID != "" {
 				cleanupIDs = append(cleanupIDs, podID)
 			}
 
 			if testStub != nil {
-				if lastID := testStub.Plugin.LastRunPodSandboxID(); lastID != "" &&
-					!slices.Contains(cleanupIDs, lastID) {
+				lastID := testStub.Plugin.LastRunPodSandboxID(nriTestPodNamePrefix)
+				if lastID != "" && !slices.Contains(cleanupIDs, lastID) {
 					cleanupIDs = append(cleanupIDs, lastID)
 				}
 			}
@@ -467,7 +469,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("verifying the NRI RunPodSandbox hook actually fired")
 				// The hook records its event before returning the error, so the
 				// attempted sandbox ID is available for the cleanup/leak check.
-				attemptedID := testStub.Plugin.LastRunPodSandboxID()
+				attemptedID := testStub.Plugin.LastRunPodSandboxID(podSandboxName)
 				Expect(attemptedID).NotTo(BeEmpty(),
 					"NRI RunPodSandbox hook should have fired before the failure")
 

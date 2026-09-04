@@ -26,6 +26,11 @@ import (
 	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
+// nriTestPodNamePrefix is the prefix every pod sandbox name built by this package
+// shares. Cleanup and leak checks scope their lookups of the stub's recorded events
+// by it, so a sandbox created on the node by anyone else is never matched.
+const nriTestPodNamePrefix = "nri-test-"
+
 // nriTestClients returns the CRI runtime and image clients of the framework,
 // skipping the running spec if no NRI socket has been configured. It has to be
 // called from within a Ginkgo node, because the framework only connects its
