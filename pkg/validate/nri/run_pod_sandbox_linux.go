@@ -133,28 +133,30 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// against the hook being invoked more than once, which would
 				// otherwise panic on a double close of hookReached and race on
 				// hookPodID.
-				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
-					firstInvocation := false
+				testStub.Plugin.SetOnRunPodSandbox(
+					func(hookCtx context.Context, pod *nri.PodSandbox) error {
+						firstInvocation := false
 
-					hookOnce.Do(func() { firstInvocation = true })
+						hookOnce.Do(func() { firstInvocation = true })
 
-					// Skip duplicate invocations so they are not blocked by the
-					// test channel handshake.
-					if !firstInvocation {
+						// Skip duplicate invocations so they are not blocked by the
+						// test channel handshake.
+						if !firstInvocation {
+							return nil
+						}
+
+						hookPodID = pod.GetId()
+
+						close(hookReached)
+						// Block until test signals to continue or context is cancelled (cleanup)
+						select {
+						case <-hookBlocking:
+						case <-hookCtx.Done():
+						}
+
 						return nil
-					}
-
-					hookPodID = pod.GetId()
-
-					close(hookReached)
-					// Block until test signals to continue or context is cancelled (cleanup)
-					select {
-					case <-hookBlocking:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
+					},
+				)
 
 				By("triggering RunPodSandbox in a goroutine")
 
@@ -250,7 +252,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("releasing the hook and verifying pod becomes Ready")
 				releaseHook()
 				runWg.Wait()
+
 				joinInFlightRun = nil
+
 				Expect(
 					runErr,
 				).NotTo(HaveOccurred(), "RunPodSandbox should succeed after hook returns")
@@ -290,28 +294,30 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// ID. sync.Once guards against the hook being invoked more than
 				// once, which would otherwise panic on a double close of
 				// hookReached and race on hookPodID.
-				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
-					firstInvocation := false
+				testStub.Plugin.SetOnRunPodSandbox(
+					func(hookCtx context.Context, pod *nri.PodSandbox) error {
+						firstInvocation := false
 
-					hookOnce.Do(func() { firstInvocation = true })
+						hookOnce.Do(func() { firstInvocation = true })
 
-					// Skip duplicate invocations so they are not blocked by the
-					// test channel handshake.
-					if !firstInvocation {
+						// Skip duplicate invocations so they are not blocked by the
+						// test channel handshake.
+						if !firstInvocation {
+							return nil
+						}
+
+						hookPodID = pod.GetId()
+
+						close(hookReached)
+
+						select {
+						case <-hookBlocking:
+						case <-hookCtx.Done():
+						}
+
 						return nil
-					}
-
-					hookPodID = pod.GetId()
-
-					close(hookReached)
-
-					select {
-					case <-hookBlocking:
-					case <-hookCtx.Done():
-					}
-
-					return nil
-				}
+					},
+				)
 
 				By("pulling the test image before triggering RunPodSandbox")
 				framework.PullPublicImage(
@@ -414,7 +420,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("releasing the hook and verifying pod becomes Ready")
 				releaseHook()
 				runWg.Wait()
+
 				joinInFlightRun = nil
+
 				Expect(
 					runErr,
 				).NotTo(HaveOccurred(), "RunPodSandbox should succeed after hook returns")
@@ -468,17 +476,19 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// Fail only the first RunPodSandbox invocation so the retry can pass.
 				var failOnce sync.Once
 
-				testStub.Plugin.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
-					shouldFail := false
+				testStub.Plugin.SetOnRunPodSandbox(
+					func(_ context.Context, _ *nri.PodSandbox) error {
+						shouldFail := false
 
-					failOnce.Do(func() { shouldFail = true })
+						failOnce.Do(func() { shouldFail = true })
 
-					if shouldFail {
-						return errors.New("induced NRI RunPodSandbox failure")
-					}
+						if shouldFail {
+							return errors.New("induced NRI RunPodSandbox failure")
+						}
 
-					return nil
-				}
+						return nil
+					},
+				)
 
 				By("building the pod sandbox config")
 
