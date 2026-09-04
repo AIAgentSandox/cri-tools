@@ -88,6 +88,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 			if testStub != nil {
 				testStub.Cleanup()
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed ID or a stopped stub from this one.
+			testStub, podID, containerID = nil, "", ""
 		})
 
 		It(
@@ -301,6 +305,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 			if testStub != nil {
 				testStub.Cleanup()
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed ID or a stopped stub from this one.
+			testStub, podID, containerID = nil, "", ""
 		})
 
 		It(
