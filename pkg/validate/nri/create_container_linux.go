@@ -177,6 +177,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Linux:   &runtimeapi.LinuxContainerConfig{},
 				}
 
+				// Capture the sandbox ID before launching the goroutine. An
+				// assertion failure between here and the Wait() below aborts the
+				// spec without joining, so AfterEach can reset podID while this
+				// goroutine is still reading it.
+				sandboxID := podID
+
 				var (
 					createErr error
 					createdID string
@@ -186,7 +192,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				createWg.Go(func() {
 					createdID, createErr = rc.CreateContainer(
 						ctx,
-						podID,
+						sandboxID,
 						containerConfig,
 						podConfig,
 					)

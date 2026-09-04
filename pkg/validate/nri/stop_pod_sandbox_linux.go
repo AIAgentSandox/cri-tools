@@ -179,13 +179,19 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("triggering StopPodSandbox in a goroutine")
 
+				// Capture the sandbox ID before launching the goroutine. An
+				// assertion failure between here and the Wait() below aborts the
+				// spec without joining, so AfterEach can reset podID while this
+				// goroutine is still reading it.
+				sandboxID := podID
+
 				var (
 					stopErr error
 					stopWg  sync.WaitGroup
 				)
 
 				stopWg.Go(func() {
-					stopErr = rc.StopPodSandbox(ctx, podID)
+					stopErr = rc.StopPodSandbox(ctx, sandboxID)
 				})
 
 				By("waiting for StopPodSandbox hook to be reached")
