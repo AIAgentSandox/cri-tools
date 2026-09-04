@@ -102,15 +102,21 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("waiting for all pod lifecycle NRI events")
 				// At least 3 events expected (Run, Stop, Remove); future NRI versions
 				// may add more extensibility points, so we use >= rather than ==.
-				events, err := testStub.Plugin.WaitForEventCount(3, 10*time.Second)
-				Expect(
-					err,
-				).NotTo(HaveOccurred(), "NRI stub did not receive all pod lifecycle events")
+				//
+				// Poll on the events belonging to the sandbox this spec created
+				// rather than on the plugin's total event count: the plugin also
+				// records events from sandboxes created concurrently on the node,
+				// so "3 events recorded" does not imply "3 events for this pod".
+				// Waiting on the total first and only then filtering would fail
+				// the spec as soon as unrelated events won the race.
+				var podEvents []NRIEvent
 
-				// Filter events for this specific pod
-				podEvents := FilterEventsByPodID(events, podID)
-				Expect(len(podEvents)).To(BeNumerically(">=", 3),
-					"expected at least 3 NRI events for pod %s, got %d", podID, len(podEvents))
+				Eventually(func() int {
+					podEvents = FilterEventsByPodID(testStub.Plugin.Events(), podID)
+
+					return len(podEvents)
+				}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 3),
+					"expected at least 3 NRI events for pod %s", podID)
 
 				By("verifying RunPodSandbox event has correct metadata")
 
