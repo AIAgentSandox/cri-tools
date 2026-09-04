@@ -150,26 +150,30 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred())
 
 				By("waiting for all container lifecycle NRI events")
-				// We expect at least 4 container events: Create, Start, Stop, Remove
-				events, err := testStub.Plugin.WaitForEventCount(4, 10*time.Second)
-				Expect(
-					err,
-				).NotTo(HaveOccurred(), "NRI stub did not receive all container lifecycle events")
-
-				// Filter for events belonging to the container this spec created.
-				// Matching on "any non-empty ContainerID" would let events from an
-				// unrelated container (e.g. leaked by an earlier spec or created
-				// concurrently on the node) satisfy the assertions below.
+				// We expect at least 4 container events: Create, Start, Stop, Remove.
+				//
+				// Poll on the events belonging to the container this spec created
+				// rather than on the plugin's total event count: the plugin also
+				// records pod events (this spec's own RunPodSandbox event can land
+				// just after Reset) and events from containers created concurrently
+				// on the node, so "4 events recorded" does not imply "4 events for
+				// this container". Matching on "any non-empty ContainerID" instead
+				// would let an unrelated container satisfy the assertions below.
 				var containerEvents []NRIEvent
 
-				for i := range events {
-					if events[i].ContainerID == containerID {
-						containerEvents = append(containerEvents, events[i])
-					}
-				}
+				Eventually(func() int {
+					containerEvents = nil
 
-				Expect(len(containerEvents)).To(BeNumerically(">=", 4),
-					"expected at least 4 container NRI events, got %d", len(containerEvents))
+					for _, e := range testStub.Plugin.Events() {
+						if e.ContainerID == containerID {
+							containerEvents = append(containerEvents, e)
+						}
+					}
+
+					return len(containerEvents)
+				}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 4),
+					"NRI stub did not receive all container lifecycle events for container %s",
+					containerID)
 
 				By("verifying CreateContainer event has correct metadata")
 

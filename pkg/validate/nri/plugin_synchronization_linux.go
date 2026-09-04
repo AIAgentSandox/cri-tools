@@ -141,6 +141,21 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Fail("timed out waiting for the second plugin's Synchronize hook to fire")
 			}
 
+			// The caller can fail an assertion at any point between this helper
+			// returning and waitReady(), and its own `defer stub.Cleanup()` only
+			// registers once waitReady returns. Register the teardown here so the
+			// second plugin is always released and disconnected: otherwise it stays
+			// registered with the runtime holding Synchronize open, which breaks
+			// every NRI spec that runs after this one.
+			DeferCleanup(func() {
+				release()
+				startWg.Wait()
+
+				if stub != nil {
+					stub.Cleanup()
+				}
+			})
+
 			waitReady = func() *NRITestStub {
 				startWg.Wait()
 				Expect(
@@ -208,7 +223,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 			firstStub, err = StartNRITestStub("cri-test-nri-sync-first", "00")
 			Expect(err).NotTo(HaveOccurred(), "failed to start first NRI test stub")
 
+			// Take the lock: a goroutine from a previous spec that timed out
+			// before its WaitGroup drained can still be inside recordContainer.
+			createdMu.Lock()
 			createdContainers = nil
+			createdMu.Unlock()
 
 			// Ensure test image is available
 			framework.PullPublicImage(
@@ -492,8 +511,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("waiting for the second plugin to become ready")
 
 				secondStub := waitReady()
-
-				defer secondStub.Cleanup()
+				// No explicit Cleanup here: startBlockingSyncPlugin registered an
+				// unconditional DeferCleanup for this stub.
 
 				By("waiting for the second container to be created")
 				createWg.Wait()
@@ -630,8 +649,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("waiting for the second plugin to become ready")
 
 				secondStub := waitReady()
-
-				defer secondStub.Cleanup()
+				// No explicit Cleanup here: startBlockingSyncPlugin registered an
+				// unconditional DeferCleanup for this stub.
 
 				By("waiting for the containers created during Synchronize to finish creating")
 				duringWg.Wait()
