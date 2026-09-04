@@ -51,6 +51,13 @@ var _ = framework.KubeDescribe("NRI", func() {
 			podID     string
 			podConfig *runtimeapi.PodSandboxConfig
 
+			// releaseBlockedSync is set by startBlockingSyncPlugin while a
+			// second plugin is holding Synchronize open. AfterEach calls it
+			// before touching any runtime state: a blocked Synchronize can
+			// stall the runtime's container and sandbox calls, so teardown
+			// would otherwise hang until the CRI timeout expires.
+			releaseBlockedSync func()
+
 			// createdMu guards createdContainers, which accumulates every
 			// container ID created by the spec (including ones created from
 			// goroutines while Synchronize is in progress) so AfterEach can
@@ -143,18 +150,27 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			// The caller can fail an assertion at any point between this helper
 			// returning and waitReady(), and its own `defer stub.Cleanup()` only
-			// registers once waitReady returns. Register the teardown here so the
+			// registers once waitReady returns. Hand AfterEach the teardown so the
 			// second plugin is always released and disconnected: otherwise it stays
 			// registered with the runtime holding Synchronize open, which breaks
 			// every NRI spec that runs after this one.
-			DeferCleanup(func() {
-				release()
-				startWg.Wait()
+			//
+			// This is deliberately not a DeferCleanup: Ginkgo runs cleanup nodes
+			// only after every AfterEach has finished, so the AfterEach below
+			// would stop and remove containers and the sandbox while Synchronize
+			// is still blocked, stalling teardown until the CRI timeout expires.
+			var teardownOnce sync.Once
 
-				if stub != nil {
-					stub.Cleanup()
-				}
-			})
+			releaseBlockedSync = func() {
+				teardownOnce.Do(func() {
+					release()
+					startWg.Wait()
+
+					if stub != nil {
+						stub.Cleanup()
+					}
+				})
+			}
 
 			waitReady = func() *NRITestStub {
 				startWg.Wait()
@@ -239,6 +255,13 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
+			// Release any second plugin still holding Synchronize open, and wait
+			// for it to disconnect, before touching containers or the sandbox:
+			// the runtime may not complete those calls until Synchronize returns.
+			if releaseBlockedSync != nil {
+				releaseBlockedSync()
+			}
+
 			createdMu.Lock()
 			ids := slices.Clone(createdContainers)
 			createdMu.Unlock()
@@ -274,6 +297,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// Reset the Context-scoped state so the next spec never inherits an
 			// already-removed ID or a stopped stub from this one.
 			firstStub, podID = nil, ""
+			releaseBlockedSync = nil
 
 			createdMu.Lock()
 			createdContainers = nil
@@ -517,8 +541,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("waiting for the second plugin to become ready")
 
 				secondStub := waitReady()
-				// No explicit Cleanup here: startBlockingSyncPlugin registered an
-				// unconditional DeferCleanup for this stub.
+				// No explicit Cleanup here: startBlockingSyncPlugin handed the
+				// unconditional teardown for this stub to AfterEach.
 
 				By("waiting for the second container to be created")
 				createWg.Wait()
@@ -667,8 +691,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("waiting for the second plugin to become ready")
 
 				secondStub := waitReady()
-				// No explicit Cleanup here: startBlockingSyncPlugin registered an
-				// unconditional DeferCleanup for this stub.
+				// No explicit Cleanup here: startBlockingSyncPlugin handed the
+				// unconditional teardown for this stub to AfterEach.
 
 				By("waiting for the containers created during Synchronize to finish creating")
 				duringWg.Wait()
