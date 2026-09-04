@@ -19,6 +19,7 @@ package nri
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -52,10 +53,21 @@ var _ = framework.KubeDescribe("NRI", func() {
 		)
 
 		AfterEach(func(ctx SpecContext) {
-			// Capture the fallback sandbox ID before cleanup resets events.
-			cleanupID := podID
-			if cleanupID == "" && testStub != nil {
-				cleanupID = testStub.Plugin.LastRunPodSandboxID()
+			// Capture the sandbox IDs to clean up before the stub is stopped
+			// and its recorded events are dropped. A spec that fails before
+			// assigning podID still leaks the sandbox its goroutine created, so
+			// the stub's last observed RunPodSandbox ID is always collected as
+			// well rather than only as a fallback.
+			cleanupIDs := []string{}
+			if podID != "" {
+				cleanupIDs = append(cleanupIDs, podID)
+			}
+
+			if testStub != nil {
+				if lastID := testStub.Plugin.LastRunPodSandboxID(); lastID != "" &&
+					!slices.Contains(cleanupIDs, lastID) {
+					cleanupIDs = append(cleanupIDs, lastID)
+				}
 			}
 
 			// Stop the stub to unblock any hooks that may be holding
@@ -64,7 +76,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub.Cleanup()
 			}
 
-			if cleanupID != "" {
+			for _, cleanupID := range cleanupIDs {
 				if err := rc.StopPodSandbox(ctx, cleanupID); err != nil {
 					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", cleanupID, err)
 				}
@@ -73,6 +85,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", cleanupID, err)
 				}
 			}
+
+			// Reset the Context-scoped state so the next spec never inherits an
+			// already-removed sandbox ID or a stopped stub from this one.
+			// podConfig is deliberately left alone: a spec that timed out may
+			// still have a RunPodSandbox goroutine reading it.
+			testStub, podID = nil, ""
 		})
 
 		It(
@@ -88,13 +106,28 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				var hookPodID string
 
+				var hookOnce sync.Once
+
 				var err error
 
 				testStub, err = StartNRITestStub("cri-test-nri-block-run", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				// Configure stub to block on RunPodSandbox
+				// Configure stub to block on RunPodSandbox. sync.Once guards
+				// against the hook being invoked more than once, which would
+				// otherwise panic on a double close of hookReached and race on
+				// hookPodID.
 				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
+					firstInvocation := false
+
+					hookOnce.Do(func() { firstInvocation = true })
+
+					// Skip duplicate invocations so they are not blocked by the
+					// test channel handshake.
+					if !firstInvocation {
+						return nil
+					}
+
 					hookPodID = pod.GetId()
 
 					close(hookReached)
@@ -149,6 +182,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
 				}
 
+				// Without a sandbox ID from the hook the checks below would pass
+				// vacuously, so fail loudly instead of silently verifying nothing.
+				Expect(hookPodID).NotTo(BeEmpty(),
+					"RunPodSandbox hook MUST receive a sandbox with a non-empty ID")
+
 				By("verifying sandbox is NOT listed while hook is blocking")
 				// The sandbox should not appear in ListPodSandbox in any state
 				pods, listErr := rc.ListPodSandbox(ctx, nil)
@@ -169,16 +207,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("verifying PodSandboxStatus is not accessible while hook is blocking")
 
-				if hookPodID != "" {
-					statusResp, statusErr := rc.PodSandboxStatus(ctx, hookPodID, false)
-					// Ideally the sandbox should not be found at all. Some runtimes may
-					// return a non-Ready status instead of NotFound — both are acceptable.
-					if statusErr == nil && statusResp != nil && statusResp.GetStatus() != nil {
-						Expect(
-							statusResp.GetStatus().GetState(),
-						).NotTo(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
-							"Sandbox MUST NOT report Ready state while RunPodSandbox hook is in progress")
-					}
+				blockedResp, blockedErr := rc.PodSandboxStatus(ctx, hookPodID, false)
+				// Ideally the sandbox should not be found at all. Some runtimes may
+				// return a non-Ready status instead of NotFound — both are acceptable.
+				if blockedErr == nil && blockedResp != nil && blockedResp.GetStatus() != nil {
+					Expect(
+						blockedResp.GetStatus().GetState(),
+					).NotTo(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
+						"Sandbox MUST NOT report Ready state while RunPodSandbox hook is in progress")
 				}
 
 				By("releasing the hook and verifying pod becomes Ready")
@@ -213,13 +249,27 @@ var _ = framework.KubeDescribe("NRI", func() {
 				var (
 					err       error
 					hookPodID string
+					hookOnce  sync.Once
 				)
 
 				testStub, err = StartNRITestStub("cri-test-nri-block-container", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				// Configure stub to block RunPodSandbox and capture the sandbox ID
+				// Configure stub to block RunPodSandbox and capture the sandbox
+				// ID. sync.Once guards against the hook being invoked more than
+				// once, which would otherwise panic on a double close of
+				// hookReached and race on hookPodID.
 				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
+					firstInvocation := false
+
+					hookOnce.Do(func() { firstInvocation = true })
+
+					// Skip duplicate invocations so they are not blocked by the
+					// test channel handshake.
+					if !firstInvocation {
+						return nil
+					}
+
 					hookPodID = pod.GetId()
 
 					close(hookReached)
@@ -281,6 +331,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 					close(hookBlocking)
 					Fail("Timed out waiting for RunPodSandbox NRI hook to fire")
 				}
+
+				// An empty ID would make CreateContainer below fail for the
+				// trivial "sandbox not found" reason, passing the spec without
+				// exercising the RunPodSandbox contract at all.
+				Expect(hookPodID).NotTo(BeEmpty(),
+					"RunPodSandbox hook MUST receive a sandbox with a non-empty ID")
 
 				By("attempting container creation while RunPodSandbox hook is blocking")
 
