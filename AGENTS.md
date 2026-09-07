@@ -114,31 +114,6 @@ finding is a confirmed false positive, suppress it with an inline
 `# zizmor: ignore[<rule>]` comment on the offending line, and put a short
 justification on the line above.
 
-### Test suite layout
-
-Validation specs live under `pkg/validate/`. A large, self-contained suite gets
-its own subpackage (for example `pkg/validate/nri/`) with one file per concern,
-rather than a single oversized file.
-
-Specs register themselves from package `init()` via the top-level
-`var _ = framework.KubeDescribe(...)` pattern, so **every spec package must be
-blank-imported in `cmd/critest/cri_test.go`**:
-
-```go
-_ "sigs.k8s.io/cri-tools/pkg/validate"
-_ "sigs.k8s.io/cri-tools/pkg/validate/nri"
-```
-
-Forgetting that import fails silently: the build succeeds, `make verify` passes,
-and the specs simply never run. Because the imports look unused, take care that
-import-pruning tooling does not drop them.
-
-Platform-specific suites are gated by filename suffix (`_linux.go`) rather than
-build tags, so an entire package can be Linux-only while still being imported
-unconditionally — it compiles to an empty package elsewhere. Keep such a
-package's `doc.go` free of a platform suffix so the package still exists on
-other platforms.
-
 ### Testing
 
 The test suite is built on top of the Ginkgo testing framework. To run the tests, you will need to first build the `critest` binary and then execute it.
