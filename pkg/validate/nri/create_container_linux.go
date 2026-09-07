@@ -310,11 +310,44 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should fail CreateContainer when the NRI hook errors, leak nothing, and allow retry",
 			func(ctx SpecContext) {
+				// Build the container config up front so the hook below can scope
+				// itself to this spec's own container by name.
+				containerName := "nri-test-create-error-ctr-" + framework.NewUUID()
+				containerConfig := &runtimeapi.ContainerConfig{
+					Metadata: framework.BuildContainerMetadata(
+						containerName,
+						framework.DefaultAttempt,
+					),
+					Image: &runtimeapi.ImageSpec{
+						Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
+					},
+					Command: framework.DefaultPauseCommand,
+					Linux:   &runtimeapi.LinuxContainerConfig{},
+				}
+
 				// Fail only the first CreateContainer invocation so the retry passes.
 				var failOnce sync.Once
 
 				testStub.Plugin.SetOnCreateContainer(
-					func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
+					func(_ context.Context, pod *nri.PodSandbox, container *nri.Container) error {
+						// The plugin sees every container the runtime creates while
+						// the stub is connected, including containers created by
+						// other actors on the node (a kubelet, say). Only induce the
+						// failure for this spec's own container: an unrelated
+						// creation would otherwise consume failOnce and let the
+						// CreateContainer below succeed, failing the assertion
+						// before containerID is published for cleanup.
+						if pod.GetId() != podID {
+							return nil
+						}
+
+						// SPEC_DISCREPANCY: CRI-O does not populate the container
+						// name in NRI CreateContainer metadata, so only reject on a
+						// name that is present and belongs to another container.
+						if name := container.GetName(); name != "" && name != containerName {
+							return nil
+						}
+
 						shouldFail := false
 
 						failOnce.Do(func() { shouldFail = true })
@@ -331,19 +364,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub.Plugin.Reset()
 
 				By("attempting CreateContainer while the NRI hook is failing")
-
-				containerName := "nri-test-create-error-ctr-" + framework.NewUUID()
-				containerConfig := &runtimeapi.ContainerConfig{
-					Metadata: framework.BuildContainerMetadata(
-						containerName,
-						framework.DefaultAttempt,
-					),
-					Image: &runtimeapi.ImageSpec{
-						Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
-					},
-					Command: framework.DefaultPauseCommand,
-					Linux:   &runtimeapi.LinuxContainerConfig{},
-				}
 
 				failedContainerID, createErr := framework.CreateContainerWithError(
 					ctx,

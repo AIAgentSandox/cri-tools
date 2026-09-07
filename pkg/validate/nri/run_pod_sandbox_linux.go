@@ -129,12 +129,40 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-block-run", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
+				// Build the sandbox config up front so the hook below can scope
+				// itself to this spec's own sandbox by name. The sandbox has no ID
+				// to match on yet, and the name is unique per spec run.
+				podSandboxName := "nri-test-block-run-" + framework.NewUUID()
+				uid := framework.DefaultUIDPrefix + framework.NewUUID()
+				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+				podConfig = &runtimeapi.PodSandboxConfig{
+					Metadata: framework.BuildPodSandboxMetadata(
+						podSandboxName,
+						uid,
+						namespace,
+						framework.DefaultAttempt,
+					),
+					Linux: &runtimeapi.LinuxPodSandboxConfig{
+						CgroupParent: common.GetCgroupParent(ctx, rc),
+					},
+					Labels: framework.DefaultPodLabels,
+				}
+
 				// Configure stub to block on RunPodSandbox. sync.Once guards
 				// against the hook being invoked more than once, which would
 				// otherwise panic on a double close of hookReached and race on
 				// hookPodID.
 				testStub.Plugin.SetOnRunPodSandbox(
 					func(hookCtx context.Context, pod *nri.PodSandbox) error {
+						// The plugin sees every sandbox the runtime starts while
+						// the stub is connected, including sandboxes created by
+						// other actors on the node (a kubelet, say). Blocking one
+						// of those would stall an unrelated RunPodSandbox for the
+						// length of this spec and publish its ID as hookPodID.
+						if pod.GetName() != podSandboxName {
+							return nil
+						}
+
 						firstInvocation := false
 
 						hookOnce.Do(func() { firstInvocation = true })
@@ -159,22 +187,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 				)
 
 				By("triggering RunPodSandbox in a goroutine")
-
-				podSandboxName := "nri-test-block-run-" + framework.NewUUID()
-				uid := framework.DefaultUIDPrefix + framework.NewUUID()
-				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-				podConfig = &runtimeapi.PodSandboxConfig{
-					Metadata: framework.BuildPodSandboxMetadata(
-						podSandboxName,
-						uid,
-						namespace,
-						framework.DefaultAttempt,
-					),
-					Linux: &runtimeapi.LinuxPodSandboxConfig{
-						CgroupParent: common.GetCgroupParent(ctx, rc),
-					},
-					Labels: framework.DefaultPodLabels,
-				}
 
 				var (
 					runErr      error
@@ -290,12 +302,41 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-block-container", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
+				// Build the sandbox config up front so the hook below can scope
+				// itself to this spec's own sandbox by name. The sandbox has no ID
+				// to match on yet, and the name is unique per spec run.
+				podSandboxName := "nri-test-block-container-" + framework.NewUUID()
+				uid := framework.DefaultUIDPrefix + framework.NewUUID()
+				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
+				podConfig = &runtimeapi.PodSandboxConfig{
+					Metadata: framework.BuildPodSandboxMetadata(
+						podSandboxName,
+						uid,
+						namespace,
+						framework.DefaultAttempt,
+					),
+					Linux: &runtimeapi.LinuxPodSandboxConfig{
+						CgroupParent: common.GetCgroupParent(ctx, rc),
+					},
+					Labels: framework.DefaultPodLabels,
+				}
+
 				// Configure stub to block RunPodSandbox and capture the sandbox
 				// ID. sync.Once guards against the hook being invoked more than
 				// once, which would otherwise panic on a double close of
 				// hookReached and race on hookPodID.
 				testStub.Plugin.SetOnRunPodSandbox(
 					func(hookCtx context.Context, pod *nri.PodSandbox) error {
+						// The plugin sees every sandbox the runtime starts while
+						// the stub is connected, including sandboxes created by
+						// other actors on the node (a kubelet, say). Blocking one
+						// of those would stall an unrelated RunPodSandbox for the
+						// length of this spec and publish its ID as hookPodID,
+						// which the CreateContainer attempt below targets.
+						if pod.GetName() != podSandboxName {
+							return nil
+						}
+
 						firstInvocation := false
 
 						hookOnce.Do(func() { firstInvocation = true })
@@ -328,22 +369,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 				)
 
 				By("triggering RunPodSandbox in a goroutine")
-
-				podSandboxName := "nri-test-block-container-" + framework.NewUUID()
-				uid := framework.DefaultUIDPrefix + framework.NewUUID()
-				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
-				podConfig = &runtimeapi.PodSandboxConfig{
-					Metadata: framework.BuildPodSandboxMetadata(
-						podSandboxName,
-						uid,
-						namespace,
-						framework.DefaultAttempt,
-					),
-					Linux: &runtimeapi.LinuxPodSandboxConfig{
-						CgroupParent: common.GetCgroupParent(ctx, rc),
-					},
-					Labels: framework.DefaultPodLabels,
-				}
 
 				var (
 					runErr      error
@@ -473,25 +498,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-run-error", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				// Fail only the first RunPodSandbox invocation so the retry can pass.
-				var failOnce sync.Once
-
-				testStub.Plugin.SetOnRunPodSandbox(
-					func(_ context.Context, _ *nri.PodSandbox) error {
-						shouldFail := false
-
-						failOnce.Do(func() { shouldFail = true })
-
-						if shouldFail {
-							return errors.New("induced NRI RunPodSandbox failure")
-						}
-
-						return nil
-					},
-				)
-
 				By("building the pod sandbox config")
 
+				// The config is built before the hook is installed so the hook can
+				// scope itself to this spec's own sandbox by name.
 				podSandboxName := "nri-test-run-error-" + framework.NewUUID()
 				uid := framework.DefaultUIDPrefix + framework.NewUUID()
 				namespace := framework.DefaultNamespacePrefix + framework.NewUUID()
@@ -507,6 +517,32 @@ var _ = framework.KubeDescribe("NRI", func() {
 					},
 					Labels: framework.DefaultPodLabels,
 				}
+
+				// Fail only the first RunPodSandbox invocation so the retry can pass.
+				var failOnce sync.Once
+
+				testStub.Plugin.SetOnRunPodSandbox(
+					func(_ context.Context, pod *nri.PodSandbox) error {
+						// The plugin sees every sandbox the runtime starts while
+						// the stub is connected, including sandboxes created by
+						// other actors on the node (a kubelet, say). An unrelated
+						// sandbox would otherwise consume failOnce and let the
+						// RunPodSandbox below succeed, and would be failed itself.
+						if pod.GetName() != podSandboxName {
+							return nil
+						}
+
+						shouldFail := false
+
+						failOnce.Do(func() { shouldFail = true })
+
+						if shouldFail {
+							return errors.New("induced NRI RunPodSandbox failure")
+						}
+
+						return nil
+					},
+				)
 
 				By("attempting RunPodSandbox while the NRI hook is failing")
 

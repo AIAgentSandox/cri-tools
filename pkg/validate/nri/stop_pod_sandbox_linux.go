@@ -111,34 +111,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-stop-state", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				// Configure stub to block during StopPodSandbox so the main
-				// goroutine can inspect runtime state while the hook is active.
-				// sync.Once guards against the hook being invoked multiple times
-				// (e.g., idempotent stop redelivery), which would otherwise panic
-				// on a double close of hookReached.
-				testStub.Plugin.SetOnStopPodSandbox(
-					func(hookCtx context.Context, _ *nri.PodSandbox) error {
-						firstInvocation := false
-
-						hookOnce.Do(func() { firstInvocation = true })
-
-						// Skip duplicate invocations (e.g., AfterEach cleanup) so
-						// they are not blocked by the test channel handshake.
-						if !firstInvocation {
-							return nil
-						}
-
-						close(hookReached)
-
-						select {
-						case <-hookBlocking:
-						case <-hookCtx.Done():
-						}
-
-						return nil
-					},
-				)
-
 				By("creating a pod sandbox")
 
 				podSandboxName := "nri-test-stop-state-" + framework.NewUUID()
@@ -197,6 +169,43 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// spec without joining, so AfterEach can reset podID while this
 				// goroutine is still reading it.
 				sandboxID := podID
+
+				// Configure stub to block during StopPodSandbox so the main
+				// goroutine can inspect runtime state while the hook is active.
+				// The hook is installed only now, once the sandbox ID it must
+				// match on is known: the plugin sees every sandbox the runtime
+				// stops while the stub is connected, and blocking an unrelated
+				// StopPodSandbox would stall it for the length of this spec and
+				// consume the handshake this spec's own stop depends on.
+				// sync.Once guards against the hook being invoked multiple times
+				// (e.g., idempotent stop redelivery), which would otherwise panic
+				// on a double close of hookReached.
+				testStub.Plugin.SetOnStopPodSandbox(
+					func(hookCtx context.Context, pod *nri.PodSandbox) error {
+						if pod.GetId() != sandboxID {
+							return nil
+						}
+
+						firstInvocation := false
+
+						hookOnce.Do(func() { firstInvocation = true })
+
+						// Skip duplicate invocations (e.g., AfterEach cleanup) so
+						// they are not blocked by the test channel handshake.
+						if !firstInvocation {
+							return nil
+						}
+
+						close(hookReached)
+
+						select {
+						case <-hookBlocking:
+						case <-hookCtx.Done():
+						}
+
+						return nil
+					},
+				)
 
 				var (
 					stopErr     error
