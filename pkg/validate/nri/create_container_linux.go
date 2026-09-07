@@ -152,7 +152,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// once, which would otherwise panic on a double close of
 				// hookReached and race on hookContainerID.
 				testStub.Plugin.SetOnCreateContainer(
-					func(hookCtx context.Context, _ *nri.PodSandbox, container *nri.Container) error {
+					func(hookCtx context.Context, pod *nri.PodSandbox, container *nri.Container) error {
+						// The plugin sees every container the runtime creates
+						// while the stub is connected, including containers
+						// created by other actors on the node (a kubelet, say).
+						// hookContainerID is published for destructive cleanup
+						// below, so only ever participate in the handshake for a
+						// container going into this spec's own sandbox.
+						if pod.GetId() != podID {
+							return nil
+						}
+
 						firstInvocation := false
 
 						hookOnce.Do(func() { firstInvocation = true })
