@@ -148,6 +148,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				var hookOnce sync.Once
 
+				// Capture the sandbox ID before it is read off the main
+				// goroutine. Both the hook below (which runs on the stub's
+				// request-handler goroutine, which Stop() only waits a bounded
+				// time for) and the CreateContainer goroutine further down can
+				// still be live when AfterEach resets podID: an assertion
+				// failure aborts the spec without joining them.
+				sandboxID := podID
+
 				// sync.Once guards against the hook being invoked more than
 				// once, which would otherwise panic on a double close of
 				// hookReached and race on hookContainerID.
@@ -159,7 +167,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 						// hookContainerID is published for destructive cleanup
 						// below, so only ever participate in the handshake for a
 						// container going into this spec's own sandbox.
-						if pod.GetId() != podID {
+						if pod.GetId() != sandboxID {
 							return nil
 						}
 
@@ -201,12 +209,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Command: framework.DefaultPauseCommand,
 					Linux:   &runtimeapi.LinuxContainerConfig{},
 				}
-
-				// Capture the sandbox ID before launching the goroutine. An
-				// assertion failure between here and the Wait() below aborts the
-				// spec without joining, so AfterEach can reset podID while this
-				// goroutine is still reading it.
-				sandboxID := podID
 
 				var (
 					createErr   error
@@ -328,6 +330,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// Fail only the first CreateContainer invocation so the retry passes.
 				var failOnce sync.Once
 
+				// Capture the sandbox ID before installing the hook: the hook
+				// runs on the stub's request-handler goroutine, which Stop()
+				// only waits a bounded time for, so AfterEach can reset podID
+				// while a late invocation is still reading it.
+				sandboxID := podID
+
 				testStub.Plugin.SetOnCreateContainer(
 					func(_ context.Context, pod *nri.PodSandbox, container *nri.Container) error {
 						// The plugin sees every container the runtime creates while
@@ -337,7 +345,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 						// creation would otherwise consume failOnce and let the
 						// CreateContainer below succeed, failing the assertion
 						// before containerID is published for cleanup.
-						if pod.GetId() != podID {
+						if pod.GetId() != sandboxID {
 							return nil
 						}
 
