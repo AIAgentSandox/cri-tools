@@ -118,6 +118,12 @@ justification on the line above.
 
 The test suite is built on top of the Ginkgo testing framework. To run the tests, you will need to first build the `critest` binary and then execute it.
 
+Before adding a new spec package under `pkg/validate/`, read
+[Test suite layout](README.md#test-suite-layout) in the README: every spec
+package must be blank-imported in `cmd/critest/cri_test.go`, and forgetting that
+import fails silently — the build succeeds, `make verify` passes, and the specs
+never run.
+
 #### Running `critest` tests in Parallel
 
 The tests can be run in parallel to speed up execution. The following command runs the tests in parallel with 8 processes (replace `<GOOS>` and `<GOARCH>` with your operating system and architecture, e.g., `linux` and `amd64`):

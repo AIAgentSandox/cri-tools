@@ -58,6 +58,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// would otherwise hang until the CRI timeout expires.
 			releaseBlockedSync func()
 
+			// joinInFlightCreate is set by specs that leave CreateContainer
+			// calls running in goroutines while a second plugin's Synchronize
+			// is blocked. AfterEach calls it (after releaseBlockedSync, which
+			// is what unblocks those calls at the runtime) so cleanup never
+			// stops and removes the sandbox while a goroutine is still
+			// creating containers in it, and so no goroutine is left reading
+			// podConfig once the next spec reassigns it.
+			joinInFlightCreate func()
+
 			// createdMu guards createdContainers, which accumulates every
 			// container ID created by the spec (including ones created from
 			// goroutines while Synchronize is in progress) so AfterEach can
@@ -264,6 +273,13 @@ var _ = framework.KubeDescribe("NRI", func() {
 				releaseBlockedSync()
 			}
 
+			// Now that Synchronize is no longer blocking, join any container
+			// creation a spec left in flight so createdContainers below is
+			// complete and nothing races with the removals.
+			if joinInFlightCreate != nil {
+				joinInFlightCreate()
+			}
+
 			createdMu.Lock()
 			ids := slices.Clone(createdContainers)
 			createdMu.Unlock()
@@ -299,7 +315,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			// Reset the Context-scoped state so the next spec never inherits an
 			// already-removed ID or a stopped stub from this one.
 			firstStub, podID = nil, ""
-			releaseBlockedSync = nil
+			releaseBlockedSync, joinInFlightCreate = nil, nil
 
 			createdMu.Lock()
 			createdContainers = nil
@@ -531,6 +547,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Expect(rc.StartContainer(ctx, id)).NotTo(HaveOccurred())
 				})
 
+				// waitReady() below asserts, so the spec can unwind straight to
+				// AfterEach without reaching the Wait(). Hand AfterEach the join.
+				joinInFlightCreate = createWg.Wait
+
 				// Hold the Synchronize call open briefly so the CreateContainer
 				// request is in flight at the runtime while the second plugin is
 				// still synchronizing. This is coordination to widen the race
@@ -548,6 +568,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("waiting for the second container to be created")
 				createWg.Wait()
+
+				joinInFlightCreate = nil
+
 				Expect(createdID).NotTo(BeEmpty())
 
 				By(
@@ -682,6 +705,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 					})
 				}
 
+				// waitReady() below asserts, so the spec can unwind straight to
+				// AfterEach without reaching the Wait(). Hand AfterEach the join.
+				joinInFlightCreate = duringWg.Wait
+
 				// Hold Synchronize open briefly so the CreateContainer requests are in
 				// flight at the runtime while the second plugin is still
 				// synchronizing. Coordination to widen the race window, not an assertion.
@@ -698,6 +725,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("waiting for the containers created during Synchronize to finish creating")
 				duringWg.Wait()
+
+				joinInFlightCreate = nil
 
 				By("creating containers AFTER the second plugin is ready")
 

@@ -41,7 +41,7 @@ type NRITestStub struct {
 //
 // Optional configure callbacks run against the plugin before it connects, so
 // tests can install hooks that fire during the registration/Synchronize
-// handshake (e.g. OnSynchronize), which cannot be set after this call returns
+// handshake (e.g. SetOnSynchronize), which cannot be set after this call returns
 // because the handshake has already completed by then.
 func StartNRITestStub(
 	pluginName, pluginIdx string,
@@ -106,6 +106,12 @@ func StartNRITestStub(
 	case <-done:
 		cancel()
 
+		// s.Run only calls Stop() itself on the ctx.Done() branch; when it
+		// returns because the ttrpc server closed, the multiplexed connections
+		// and the dialed unix socket stay open. Stop() is idempotent, so call
+		// it unconditionally before bailing out.
+		s.Stop()
+
 		// s.Run returns nil when the stub's server closes cleanly, so guard the
 		// %w verb: wrapping a nil error renders as "%!w(<nil>)".
 		if runErr := <-errCh; runErr != nil {
@@ -121,7 +127,11 @@ func StartNRITestStub(
 		// internal channel read (cfgErrC) that doesn't observe context cancellation.
 		select {
 		case <-done:
-			// Goroutine finished; safe to read the error.
+			// Goroutine finished; release whatever Run() left open (Stop() is
+			// idempotent, so it is safe even when Run() already called it on
+			// its ctx.Done() branch) and read the error.
+			s.Stop()
+
 			if runErr := <-errCh; runErr != nil {
 				return nil, fmt.Errorf("NRI stub did not become ready within 10s: %w", runErr)
 			}
