@@ -399,6 +399,7 @@ var _ = framework.KubeDescribe("Image Volume [Feature:ImageVolume]", func() {
 			framework.ExpectNoError(err, "failed to start container")
 
 			By("Checking whether the image volume mount point exists")
+
 			cmd := []string{"ls", containerPath}
 
 			_, _, err = rc.ExecSync(
