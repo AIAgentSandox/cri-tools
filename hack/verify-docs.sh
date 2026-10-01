@@ -25,14 +25,7 @@ if [[ ! -x "$GO_MD2MAN" ]]; then
     go install -C "${HACK_DIR}/tools" "$MD2MAN@$(go list -m -f \{\{.Version\}\} $MD2MAN)"
 fi
 
-"$GO_MD2MAN" -in docs/crictl.md -out docs/crictl.1
+source "$(dirname "${BASH_SOURCE[0]}")/lib/generated.sh"
 
-STATUS=$(git status --porcelain)
-if [[ -z $STATUS ]]; then
-    echo "tree is clean"
-else
-    echo "tree is dirty, please commit all changes"
-    echo ""
-    echo "$STATUS"
-    exit 1
-fi
+GENERATED_PATHS=(docs/crictl.1)
+verify_generated "$GO_MD2MAN" -in docs/crictl.md -out docs/crictl.1
