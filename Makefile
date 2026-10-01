@@ -272,11 +272,12 @@ test-e2e: $(GINKGO) ## Run the e2e test suite.
 		$(TESTFLAGS)
 
 .PHONY: test-critest-containerd
-test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version).
+test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME, DATA_VOLUME_SUFFIX (defaults to the target name); images are cached per version).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	RUNC_FLAVOR=$(RUNC_FLAVOR) \
 	RUNTIME=$(RUNTIME) \
+	DATA_VOLUME_SUFFIX=$(or $(DATA_VOLUME_SUFFIX),$@) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
 		--runtime-endpoint=unix:///run/containerd/containerd.sock \
 		--parallel=$(PARALLEL) \
@@ -286,11 +287,12 @@ test-critest-containerd: ## Run the critest in a container with containerd (set 
 		$(TESTFLAGS)
 
 .PHONY: test-crictl-e2e-containerd
-test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version).
+test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME, DATA_VOLUME_SUFFIX (defaults to the target name); images are cached per version).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	RUNC_FLAVOR=$(RUNC_FLAVOR) \
 	RUNTIME=$(RUNTIME) \
+	DATA_VOLUME_SUFFIX=$(or $(DATA_VOLUME_SUFFIX),$@) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/crictl-e2e \
 		-crictl-binary-path=/usr/local/bin/critest-tools/crictl \
 		-crictl-runtime-endpoint=unix:///run/containerd/containerd.sock \
@@ -304,7 +306,7 @@ clean-containerd-test-images: ## Remove cached containerd-local-test images and 
 	# without GNU-only `xargs -r` so the target also works on macOS/BSD.
 	images=$$(docker images --filter=reference='containerd-local-test:*' -q | sort -u); \
 	if [ -n "$$images" ]; then docker rmi -f $$images; fi
-	# Remove the per-version named data volumes (containerd-local-test-data-*).
+	# Remove the per-version, per-suite named data volumes (containerd-local-test-data-*).
 	volumes=$$(docker volume ls --filter=name='containerd-local-test-data' -q); \
 	if [ -n "$$volumes" ]; then docker volume rm -f $$volumes; fi
 
