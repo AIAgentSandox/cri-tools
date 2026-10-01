@@ -87,10 +87,11 @@ fi
 # across versions risks corruption. Also namespace it per test suite so that
 # suites do not interfere with each other's runtime state (e.g. crictl e2e
 # removing all images cached by critest). The suffix defaults to the name of the
-# test binary (the Makefile passes the make target name) and can be overridden
-# with DATA_VOLUME_SUFFIX. The clean target removes all of them.
+# test binary and can be overridden with DATA_VOLUME_SUFFIX; it is sanitized
+# like the image tag, as volume names may only contain [a-zA-Z0-9_.-].
+# The clean target removes all of them.
 DATA_VOLUME_SUFFIX="${DATA_VOLUME_SUFFIX:-$(basename "$1")}"
-DATA_VOLUME="containerd-local-test-data-${IMAGE_TAG}-${DATA_VOLUME_SUFFIX}"
+DATA_VOLUME="containerd-local-test-data-${IMAGE_TAG}-${DATA_VOLUME_SUFFIX//[^a-zA-Z0-9_.-]/-}"
 
 # Run the e2e tests in the container
 # We mount the local build directory to /usr/local/bin/critest-tools

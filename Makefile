@@ -259,6 +259,11 @@ endif
 # critest parallelism, mirrors CI's --parallel=8. Override via PARALLEL=N.
 PARALLEL ?= 8
 
+# Each test suite gets its own containerd data volume, named after the test
+# binary, so that one suite does not drop images or runtime state cached by
+# another. Override via DATA_VOLUME_SUFFIX=foo to run a suite against a
+# separate volume.
+
 .PHONY: test-e2e
 test-e2e: $(GINKGO) ## Run the e2e test suite.
 	$(GINKGO) \
@@ -272,12 +277,11 @@ test-e2e: $(GINKGO) ## Run the e2e test suite.
 		$(TESTFLAGS)
 
 .PHONY: test-critest-containerd
-test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME, DATA_VOLUME_SUFFIX (defaults to the target name); images are cached per version).
+test-critest-containerd: ## Run the critest in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version and suite).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	RUNC_FLAVOR=$(RUNC_FLAVOR) \
 	RUNTIME=$(RUNTIME) \
-	DATA_VOLUME_SUFFIX=$(or $(DATA_VOLUME_SUFFIX),$@) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/critest \
 		--runtime-endpoint=unix:///run/containerd/containerd.sock \
 		--parallel=$(PARALLEL) \
@@ -287,12 +291,11 @@ test-critest-containerd: ## Run the critest in a container with containerd (set 
 		$(TESTFLAGS)
 
 .PHONY: test-crictl-e2e-containerd
-test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME, DATA_VOLUME_SUFFIX (defaults to the target name); images are cached per version).
+test-crictl-e2e-containerd: ## Run the crictl e2e tests in a container with containerd (set CONTAINERD_VERSION=main|release/1.7, RUNC_FLAVOR, RUNTIME; images are cached per version and suite).
 	# AppArmor tests must be skipped as the containerized environment does not support them.
 	CONTAINERD_VERSION=$(CONTAINERD_VERSION) \
 	RUNC_FLAVOR=$(RUNC_FLAVOR) \
 	RUNTIME=$(RUNTIME) \
-	DATA_VOLUME_SUFFIX=$(or $(DATA_VOLUME_SUFFIX),$@) \
 	hack/run-e2e-container.sh /usr/local/bin/critest-tools/crictl-e2e \
 		-crictl-binary-path=/usr/local/bin/critest-tools/crictl \
 		-crictl-runtime-endpoint=unix:///run/containerd/containerd.sock \
