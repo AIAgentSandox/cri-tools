@@ -18,31 +18,37 @@
 # the whole working tree to be clean.
 
 # snapshot_paths prints a git tree hash of the working tree content of the
-# given paths, including uncommitted and untracked files. The real index is
-# left untouched.
+# given paths, including uncommitted and untracked files. It works on a copy
+# of the index in SNAPSHOT_INDEX, so the real index is left untouched.
+# Errors are returned explicitly because errexit is not inherited by command
+# substitution.
 snapshot_paths() {
-    local index
-    index=$(mktemp)
-    cp "$(git rev-parse --git-path index)" "$index"
-    GIT_INDEX_FILE="$index" git add -A -- "$@"
-    GIT_INDEX_FILE="$index" git write-tree
-    rm -f "$index"
+    local real_index
+    real_index=$(git rev-parse --git-path index) || return 1
+    cp "$real_index" "$SNAPSHOT_INDEX" || return 1
+    GIT_INDEX_FILE="$SNAPSHOT_INDEX" git add -A -- "$@" || return 1
+    GIT_INDEX_FILE="$SNAPSHOT_INDEX" git write-tree
 }
 
 # verify_generated runs the given command and fails if it modified any of
 # the paths listed in GENERATED_PATHS.
 verify_generated() {
     local before after
-    before=$(snapshot_paths "${GENERATED_PATHS[@]}")
-    "$@"
-    after=$(snapshot_paths "${GENERATED_PATHS[@]}")
+    SNAPSHOT_INDEX=$(mktemp) || exit 1
+    trap 'rm -f "$SNAPSHOT_INDEX"' EXIT
 
-    if [[ "$before" == "$after" ]]; then
+    before=$(snapshot_paths "${GENERATED_PATHS[@]}") || exit 1
+    "$@"
+    after=$(snapshot_paths "${GENERATED_PATHS[@]}") || exit 1
+
+    # Only compare the generated paths: the rest of the trees comes from the
+    # real index, which may change while the command runs.
+    if git diff --quiet "$before" "$after" -- "${GENERATED_PATHS[@]}"; then
         echo "generated files are up to date"
     else
         echo "generated files were out of date and have been regenerated:"
         echo ""
-        git diff --stat "$before" "$after"
+        git diff --stat "$before" "$after" -- "${GENERATED_PATHS[@]}"
         exit 1
     fi
 }
