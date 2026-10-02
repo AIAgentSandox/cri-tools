@@ -18,13 +18,13 @@ package nri
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"slices"
 	"sync"
 	"time"
 
 	nri "github.com/containerd/nri/pkg/api"
-	"github.com/containerd/nri/pkg/stub"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"google.golang.org/grpc/codes"
@@ -46,24 +46,38 @@ type updatePodSandboxCall struct {
 }
 
 // updatePodSandboxPlugin is an NRI plugin dedicated to the UpdatePodSandbox
-// tests. It records UpdatePodSandbox requests and PostUpdatePodSandbox events,
-// and can be configured to reject UpdatePodSandbox requests with an error.
+// tests. It records the pods it is synchronized with, the UpdatePodSandbox
+// requests and the PostUpdatePodSandbox events, and can be configured to fail
+// either of the two hooks.
 type updatePodSandboxPlugin struct {
-	mu          sync.Mutex
-	updates     []updatePodSandboxCall
-	postUpdates []string
-	updateErr   error
+	mu            sync.Mutex
+	syncedPods    map[string]*nri.PodSandbox
+	updates       []updatePodSandboxCall
+	postUpdates   []string
+	updateErr     error
+	postUpdateErr error
 
 	ready     chan struct{}
 	readyOnce sync.Once
 }
 
-// Synchronize implements stub.SynchronizeInterface and signals readiness.
+// Synchronize implements stub.SynchronizeInterface. It captures the pods the
+// runtime reconciles the plugin with - including their current pod-level
+// resources - and signals readiness.
 func (p *updatePodSandboxPlugin) Synchronize(
-	context.Context,
-	[]*nri.PodSandbox,
-	[]*nri.Container,
+	_ context.Context,
+	pods []*nri.PodSandbox,
+	_ []*nri.Container,
 ) ([]*nri.ContainerUpdate, error) {
+	p.mu.Lock()
+
+	p.syncedPods = make(map[string]*nri.PodSandbox, len(pods))
+	for _, pod := range pods {
+		p.syncedPods[pod.GetId()] = pod
+	}
+
+	p.mu.Unlock()
+
 	p.readyOnce.Do(func() { close(p.ready) })
 
 	return nil, nil
@@ -99,7 +113,7 @@ func (p *updatePodSandboxPlugin) PostUpdatePodSandbox(
 
 	p.postUpdates = append(p.postUpdates, pod.GetId())
 
-	return nil
+	return p.postUpdateErr
 }
 
 // setUpdateErr configures the error returned from subsequent UpdatePodSandbox requests.
@@ -108,6 +122,23 @@ func (p *updatePodSandboxPlugin) setUpdateErr(err error) {
 	defer p.mu.Unlock()
 
 	p.updateErr = err
+}
+
+// setPostUpdateErr configures the error returned from subsequent
+// PostUpdatePodSandbox events.
+func (p *updatePodSandboxPlugin) setPostUpdateErr(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.postUpdateErr = err
+}
+
+// syncedPod returns the pod the plugin was synchronized with on connect, or nil.
+func (p *updatePodSandboxPlugin) syncedPod(podID string) *nri.PodSandbox {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.syncedPods[podID]
 }
 
 // updatesFor returns the UpdatePodSandbox requests recorded for podID.
@@ -143,66 +174,29 @@ func (p *updatePodSandboxPlugin) postUpdateCountFor(podID string) int {
 }
 
 // updatePodSandboxStub runs an updatePodSandboxPlugin connected to the runtime.
+//
+// It uses the same stub lifecycle helper as StartNRITestStub; only the plugin
+// implementation differs, because the set of NRI events a plugin subscribes to
+// is derived from the interfaces it implements and the UpdatePodSandbox events
+// must not be subscribed to by the other NRI specs (runtimes predating them
+// reject such a plugin during registration).
 type updatePodSandboxStub struct {
+	*nriStubConn
+
 	plugin *updatePodSandboxPlugin
-	cancel context.CancelFunc
-	done   chan struct{}
 }
 
 // startUpdatePodSandboxStub connects an updatePodSandboxPlugin to the
 // runtime's NRI socket and waits for the registration handshake to complete.
 func startUpdatePodSandboxStub(pluginName, pluginIdx string) (*updatePodSandboxStub, error) {
-	socketPath := framework.TestContext.NRISocketPath
-	if socketPath == "" {
-		return nil, errors.New("NRI socket path not configured")
-	}
-
 	plugin := &updatePodSandboxPlugin{ready: make(chan struct{})}
 
-	s, err := stub.New(plugin,
-		stub.WithPluginName(pluginName),
-		stub.WithPluginIdx(pluginIdx),
-		stub.WithSocketPath(socketPath),
-	)
+	conn, err := startNRIStub(plugin, plugin.ready, pluginName, pluginIdx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create NRI stub: %w", err)
+		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer close(done)
-
-		errCh <- s.Run(ctx)
-	}()
-
-	ts := &updatePodSandboxStub{plugin: plugin, cancel: cancel, done: done}
-
-	select {
-	case <-done:
-		cancel()
-
-		return nil, fmt.Errorf("NRI stub exited early: %w", <-errCh)
-	case <-plugin.ready:
-		return ts, nil
-	case <-time.After(10 * time.Second):
-		ts.stop()
-
-		return nil, errors.New("NRI stub did not become ready within 10s")
-	}
-}
-
-// stop disconnects the plugin from the runtime.
-func (ts *updatePodSandboxStub) stop() {
-	ts.cancel()
-
-	select {
-	case <-ts.done:
-	case <-time.After(5 * time.Second):
-		framework.Logf("NRI UpdatePodSandbox stub did not stop within 5s")
-	}
+	return &updatePodSandboxStub{nriStubConn: conn, plugin: plugin}, nil
 }
 
 // skipIfUpdatePodSandboxResourcesUnimplemented probes the CRI
@@ -242,6 +236,81 @@ func expectNRIResourcesMatch(
 		"NRI %s memory limit should match the CRI request", what)
 }
 
+// expectCRIResourcesMatch asserts that the pod-level resources the runtime
+// reports as applied carry the values requested via CRI.
+func expectCRIResourcesMatch(
+	got, want *runtimeapi.LinuxContainerResources,
+	what string,
+) {
+	Expect(got).NotTo(BeNil(), "the runtime should report the applied %s resources", what)
+	Expect(got.GetCpuShares()).To(Equal(want.GetCpuShares()),
+		"applied %s CPU shares should match the CRI request", what)
+	Expect(got.GetCpuQuota()).To(Equal(want.GetCpuQuota()),
+		"applied %s CPU quota should match the CRI request", what)
+	Expect(got.GetCpuPeriod()).To(Equal(want.GetCpuPeriod()),
+		"applied %s CPU period should match the CRI request", what)
+	Expect(got.GetMemoryLimitInBytes()).To(Equal(want.GetMemoryLimitInBytes()),
+		"applied %s memory limit should match the CRI request", what)
+}
+
+// updatePodSandboxVerboseInfo is the subset of the runtime-specific verbose
+// PodSandboxStatus info the specs read. containerd reports the resources and
+// overhead of the last applied UpdatePodSandboxResources call here; both are
+// absent until an update has been applied.
+type updatePodSandboxVerboseInfo struct {
+	Overhead  *runtimeapi.ContainerResources `json:"overhead"`
+	Resources *runtimeapi.ContainerResources `json:"resources"`
+}
+
+// updatePodSandboxAppliedResources returns the pod-level resources the runtime
+// reports as applied to the sandbox, read from the verbose PodSandboxStatus
+// info. This is the only place a CRI client can observe whether a pod resource
+// update took effect: the PodSandboxStatus fields do not carry pod-level
+// resources, and the NRI pod sandbox the runtime synchronizes plugins with
+// keeps reporting the resources the sandbox was created with.
+//
+// The last return value is false when the runtime reports no applied pod
+// resources at all, either because no update has been applied yet or because
+// it does not expose them in its (runtime-specific) verbose info.
+func updatePodSandboxAppliedResources(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	podID string,
+) (overhead, resources *runtimeapi.LinuxContainerResources, ok bool) {
+	statusResp, err := rc.PodSandboxStatus(ctx, podID, true)
+	Expect(err).NotTo(HaveOccurred(), "verbose PodSandboxStatus")
+
+	raw, found := statusResp.GetInfo()["info"]
+	if !found {
+		return nil, nil, false
+	}
+
+	info := updatePodSandboxVerboseInfo{}
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		framework.Logf("failed to parse the verbose PodSandboxStatus info: %v", err)
+
+		return nil, nil, false
+	}
+
+	overhead = info.Overhead.GetLinux()
+	resources = info.Resources.GetLinux()
+
+	return overhead, resources, overhead != nil || resources != nil
+}
+
+// updatePodSandboxTestResources builds the pod-level resources used by the
+// UpdatePodSandbox specs.
+func updatePodSandboxTestResources(
+	cpuShares, cpuQuota, memoryMiB int64,
+) *runtimeapi.LinuxContainerResources {
+	return &runtimeapi.LinuxContainerResources{
+		CpuShares:          cpuShares,
+		CpuQuota:           cpuQuota,
+		CpuPeriod:          100000,
+		MemoryLimitInBytes: memoryMiB * 1024 * 1024,
+	}
+}
+
 var _ = framework.KubeDescribe("NRI", func() {
 	f := framework.NewDefaultCRIFramework()
 
@@ -257,28 +326,32 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 	Context("UpdatePodSandbox", Serial, func() {
 		var (
-			testStub *updatePodSandboxStub
-			podID    string
+			stubs []*updatePodSandboxStub
+			podID string
 		)
 
-		const mib = 1024 * 1024
+		// The resources the pod sandbox is created with, the ones the specs
+		// update it to, and a third, distinct set for the specs that have to
+		// tell two updates apart.
+		var (
+			initialOverhead  = updatePodSandboxTestResources(10, 5000, 64)
+			initialResources = updatePodSandboxTestResources(256, 25000, 512)
+			updatedOverhead  = updatePodSandboxTestResources(20, 10000, 128)
+			updatedResources = updatePodSandboxTestResources(512, 50000, 1024)
+			retriedOverhead  = updatePodSandboxTestResources(30, 15000, 192)
+			retriedResources = updatePodSandboxTestResources(768, 75000, 1536)
+		)
 
-		newUpdateRequest := func(id string) *runtimeapi.UpdatePodSandboxResourcesRequest {
-			return &runtimeapi.UpdatePodSandboxResourcesRequest{
-				PodSandboxId: id,
-				Overhead: &runtimeapi.LinuxContainerResources{
-					CpuShares:          10,
-					CpuQuota:           5000,
-					CpuPeriod:          100000,
-					MemoryLimitInBytes: 16 * mib,
-				},
-				Resources: &runtimeapi.LinuxContainerResources{
-					CpuShares:          512,
-					CpuQuota:           50000,
-					CpuPeriod:          100000,
-					MemoryLimitInBytes: 256 * mib,
-				},
-			}
+		const injectedUpdateErr = "cri-test injected UpdatePodSandbox failure"
+
+		// startStub connects another plugin and registers it for cleanup.
+		startStub := func(pluginName, pluginIdx string) *updatePodSandboxStub {
+			ts, err := startUpdatePodSandboxStub(pluginName, pluginIdx)
+			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub %q", pluginName)
+
+			stubs = append(stubs, ts)
+
+			return ts
 		}
 
 		runPod := func(ctx context.Context, prefix string) (string, *runtimeapi.PodSandboxConfig) {
@@ -291,6 +364,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 				),
 				Linux: &runtimeapi.LinuxPodSandboxConfig{
 					CgroupParent: common.GetCgroupParent(ctx, rc),
+					Overhead:     initialOverhead,
+					Resources:    initialResources,
 				},
 				Labels: framework.DefaultPodLabels,
 			}
@@ -301,13 +376,61 @@ var _ = framework.KubeDescribe("NRI", func() {
 			return id, podConfig
 		}
 
+		// updateResources requests the given pod-level resources for the pod
+		// sandbox the spec created.
 		updateResources := func(
 			ctx context.Context,
-			req *runtimeapi.UpdatePodSandboxResourcesRequest,
+			overhead, resources *runtimeapi.LinuxContainerResources,
 		) error {
-			_, err := rc.UpdatePodSandboxResources(ctx, req)
+			_, err := rc.UpdatePodSandboxResources(
+				ctx,
+				&runtimeapi.UpdatePodSandboxResourcesRequest{
+					PodSandboxId: podID,
+					Overhead:     overhead,
+					Resources:    resources,
+				},
+			)
 
 			return err
+		}
+
+		// expectSyncedPodResources connects a fresh plugin and asserts the
+		// pod-level resources the runtime synchronizes it with. containerd
+		// reports the resources the sandbox was created with and does not fold
+		// applied updates into them, so this cannot tell an applied update
+		// from a discarded one - it only shows which resources a plugin
+		// joining after an update is handed. Use
+		// updatePodSandboxAppliedResources to observe an applied update.
+		expectSyncedPodResources := func(
+			pluginName, pluginIdx string,
+			overhead, resources *runtimeapi.LinuxContainerResources,
+			what string,
+		) {
+			pod := startStub(pluginName, pluginIdx).plugin.syncedPod(podID)
+			Expect(pod).NotTo(BeNil(),
+				"a newly connected plugin should be synchronized with the pod sandbox")
+			expectNRIResourcesMatch(pod.GetLinux().GetPodResources(), resources, what+" pod")
+			expectNRIResourcesMatch(pod.GetLinux().GetPodOverhead(), overhead, what+" overhead")
+		}
+
+		// expectAppliedResources asserts the pod-level resources the runtime
+		// reports as applied to the sandbox. The spec is skipped if the runtime
+		// reports none, as an applied update then cannot be distinguished from
+		// a discarded one.
+		expectAppliedResources := func(
+			ctx context.Context,
+			overhead, resources *runtimeapi.LinuxContainerResources,
+			what string,
+		) {
+			gotOverhead, gotResources, ok := updatePodSandboxAppliedResources(ctx, rc, podID)
+			if !ok {
+				Skip("the runtime does not report the applied pod-level resources in its " +
+					"verbose PodSandboxStatus info, so an applied pod resource update " +
+					"cannot be distinguished from a discarded one")
+			}
+
+			expectCRIResourcesMatch(gotResources, resources, what+" pod")
+			expectCRIResourcesMatch(gotOverhead, overhead, what+" overhead")
 		}
 
 		BeforeEach(func(ctx SpecContext) {
@@ -315,10 +438,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			if testStub != nil {
-				testStub.stop()
-				testStub = nil
+			for _, ts := range slices.Backward(stubs) {
+				ts.Stop()
 			}
+
+			stubs = nil
 
 			if podID != "" {
 				if err := rc.StopPodSandbox(ctx, podID); err != nil {
@@ -333,13 +457,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 
-		It(
-			"should relay CRI UpdatePodSandboxResources to NRI UpdatePodSandbox with the pod and requested resources",
+		It("should relay CRI UpdatePodSandboxResources to NRI UpdatePodSandbox",
 			func(ctx SpecContext) {
-				var err error
-
-				testStub, err = startUpdatePodSandboxStub("cri-test-nri-update-pod", "00")
-				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+				testStub := startStub("cri-test-nri-update-pod", "00")
 
 				By("creating a pod sandbox")
 
@@ -349,13 +469,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("calling CRI UpdatePodSandboxResources")
 
-				req := newUpdateRequest(podID)
-				Expect(updateResources(ctx, req)).To(Succeed(),
+				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
 					"UpdatePodSandboxResources should succeed when the NRI plugin accepts the update")
 
-				By(
-					"verifying the NRI UpdatePodSandbox request carries the pod and requested resources",
-				)
+				By("verifying the NRI request carries the pod and the requested resources")
 
 				updates := testStub.plugin.updatesFor(podID)
 				// UpdatePodSandbox is a synchronous NRI request, so it must have
@@ -364,27 +481,20 @@ var _ = framework.KubeDescribe("NRI", func() {
 					"NRI UpdatePodSandbox should be delivered exactly once before the CRI call returns")
 				Expect(updates[0].podName).To(Equal(podConfig.GetMetadata().GetName()))
 				Expect(updates[0].podUID).To(Equal(podConfig.GetMetadata().GetUid()))
-				expectNRIResourcesMatch(updates[0].resources, req.GetResources(), "pod")
-				expectNRIResourcesMatch(updates[0].overhead, req.GetOverhead(), "overhead")
+				expectNRIResourcesMatch(updates[0].resources, updatedResources, "pod")
+				expectNRIResourcesMatch(updates[0].overhead, updatedOverhead, "overhead")
 
 				By("verifying the NRI PostUpdatePodSandbox event is delivered")
 				Eventually(func() int {
 					return testStub.plugin.postUpdateCountFor(podID)
 				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
 					"NRI PostUpdatePodSandbox should be delivered once after a successful update")
-			},
-		)
+			})
 
 		It("should fail CRI UpdatePodSandboxResources when the NRI plugin rejects UpdatePodSandbox",
 			func(ctx SpecContext) {
-				var err error
-
-				testStub, err = startUpdatePodSandboxStub("cri-test-nri-update-pod-fail", "00")
-				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
-
-				const injected = "cri-test injected UpdatePodSandbox failure"
-
-				testStub.plugin.setUpdateErr(errors.New(injected))
+				testStub := startStub("cri-test-nri-update-pod-fail", "00")
+				testStub.plugin.setUpdateErr(errors.New(injectedUpdateErr))
 
 				By("creating a pod sandbox")
 
@@ -392,17 +502,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("calling CRI UpdatePodSandboxResources with the plugin rejecting the update")
 
-				updateErr := updateResources(ctx, newUpdateRequest(podID))
+				updateErr := updateResources(ctx, updatedOverhead, updatedResources)
 				Expect(updateErr).To(HaveOccurred(),
 					"UpdatePodSandboxResources should fail when an NRI plugin rejects UpdatePodSandbox")
-				Expect(updateErr.Error()).To(ContainSubstring(injected),
+				Expect(updateErr.Error()).To(ContainSubstring(injectedUpdateErr),
 					"the CRI error should carry the NRI plugin's error message")
 				Expect(testStub.plugin.updatesFor(podID)).To(HaveLen(1),
 					"NRI UpdatePodSandbox should have been delivered to the plugin")
 
-				By(
-					"verifying no NRI PostUpdatePodSandbox event is delivered for the rejected update",
-				)
+				By("verifying no NRI PostUpdatePodSandbox event is delivered")
 				Consistently(func() int {
 					return testStub.plugin.postUpdateCountFor(podID)
 				}, 2*time.Second, 200*time.Millisecond).Should(Equal(0),
@@ -412,16 +520,13 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				statusResp, err := rc.PodSandboxStatus(ctx, podID, false)
 				Expect(err).NotTo(HaveOccurred(), "PodSandboxStatus after rejected update")
-				Expect(
-					statusResp.GetStatus().GetState(),
-				).To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
-					"a rejected resource update should not affect the sandbox state")
+				Expect(statusResp.GetStatus().GetState()).
+					To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
+						"a rejected resource update should not affect the sandbox state")
 
 				By("verifying the plugin stays connected and a later update succeeds")
 				testStub.plugin.setUpdateErr(nil)
-				Expect(
-					updateResources(ctx, newUpdateRequest(podID)),
-				).To(Succeed(),
+				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
 					"UpdatePodSandboxResources should succeed once the plugin accepts the update")
 				Expect(testStub.plugin.updatesFor(podID)).To(HaveLen(2),
 					"the retried update should be delivered to the same, still connected, plugin")
@@ -429,6 +534,84 @@ var _ = framework.KubeDescribe("NRI", func() {
 					return testStub.plugin.postUpdateCountFor(podID)
 				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
 					"NRI PostUpdatePodSandbox should be delivered once for the successful retry")
+			})
+
+		It("should not apply the pod resources when the NRI plugin rejects UpdatePodSandbox",
+			func(ctx SpecContext) {
+				testStub := startStub("cri-test-nri-update-pod-keep", "00")
+
+				By("creating a pod sandbox with pod-level resources")
+
+				podID, _ = runPod(ctx, "nri-test-update-pod-keep-")
+
+				By("calling CRI UpdatePodSandboxResources with the plugin rejecting the update")
+				testStub.plugin.setUpdateErr(errors.New(injectedUpdateErr))
+				Expect(updateResources(ctx, retriedOverhead, retriedResources)).NotTo(Succeed(),
+					"UpdatePodSandboxResources should fail when an NRI plugin rejects UpdatePodSandbox")
+
+				By("verifying the runtime applied no pod resources")
+
+				_, _, applied := updatePodSandboxAppliedResources(ctx, rc, podID)
+				Expect(applied).To(BeFalse(),
+					"a rejected update must not be applied to the pod sandbox")
+
+				By("verifying a plugin connecting afterwards receives the old resources")
+				expectSyncedPodResources(
+					"cri-test-nri-update-pod-keep-rejected", "10",
+					initialOverhead, initialResources, "pre-update",
+				)
+
+				By("verifying a later accepted update is applied")
+				testStub.plugin.setUpdateErr(nil)
+				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
+					"UpdatePodSandboxResources should succeed once the plugin accepts the update")
+				// The accepted values, not the rejected ones, are what the
+				// runtime reports as applied. This also proves the assertion
+				// above is not vacuous: the runtime does report applied pod
+				// resources, it just had none to report after the rejection.
+				expectAppliedResources(ctx, updatedOverhead, updatedResources, "updated")
+			})
+
+		It("should apply the update when the NRI plugin fails PostUpdatePodSandbox",
+			func(ctx SpecContext) {
+				testStub := startStub("cri-test-nri-update-pod-post-fail", "00")
+
+				By("creating a pod sandbox")
+
+				podID, _ = runPod(ctx, "nri-test-update-pod-post-fail-")
+
+				By("calling CRI UpdatePodSandboxResources with the plugin failing the post-event")
+				testStub.plugin.setPostUpdateErr(
+					errors.New("cri-test injected PostUpdatePodSandbox failure"),
+				)
+				// PostUpdatePodSandbox only notifies plugins after the update
+				// has been applied, so a failing plugin must not turn the CRI
+				// call into an error.
+				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
+					"a PostUpdatePodSandbox failure must not fail CRI UpdatePodSandboxResources")
+				Eventually(func() int {
+					return testStub.plugin.postUpdateCountFor(podID)
+				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
+					"NRI PostUpdatePodSandbox should have been delivered to the plugin")
+
+				By("verifying the pod sandbox is still ready")
+
+				statusResp, err := rc.PodSandboxStatus(ctx, podID, false)
+				Expect(err).NotTo(HaveOccurred(), "PodSandboxStatus after failed post-update event")
+				Expect(statusResp.GetStatus().GetState()).
+					To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
+						"a failed post-update event should not affect the sandbox state")
+
+				By("verifying the requested resources were applied")
+				expectAppliedResources(ctx, updatedOverhead, updatedResources, "updated")
+
+				By("verifying the plugin stays connected and a later update succeeds")
+				testStub.plugin.setPostUpdateErr(nil)
+				Expect(updateResources(ctx, retriedOverhead, retriedResources)).To(Succeed(),
+					"UpdatePodSandboxResources should succeed after a failed post-update event")
+				Expect(testStub.plugin.updatesFor(podID)).To(HaveLen(2),
+					"the later update should be delivered to the same, still connected, plugin")
+				expectAppliedResources(ctx, retriedOverhead, retriedResources, "later")
 			})
 	})
 })
