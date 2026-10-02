@@ -201,14 +201,16 @@ func (p *updatePodSandboxPlugin) waitForPostUpdates(
 //
 // SPEC_DISCREPANCY: NRI defines PostUpdatePodSandbox as the event following a
 // successful UpdatePodSandbox request, and containerd emits it from its
-// UpdatePodSandboxResources handler. CRI-O (1.38) relays the synchronous
-// UpdatePodSandbox request but stops there: PostUpdatePodSandbox is absent from
-// its NRI API (internal/nri/nri.go) and never called by server/nri-api.go, so a
-// plugin subscribed to the event is registered for it but never receives one.
+// UpdatePodSandboxResources handler. CRI-O may relay the synchronous
+// UpdatePodSandbox request and stop there: at the time of writing
+// PostUpdatePodSandbox is absent from its NRI API (internal/nri/nri.go) and
+// never called by server/nri-api.go, so a plugin subscribed to the event is
+// registered for it but never receives one. A runtime that does implement the
+// event satisfies the spec and is not skipped.
 const postUpdatePodSandboxUnsupported = "spec discrepancy: the runtime relays CRI " +
 	"UpdatePodSandboxResources to the synchronous NRI UpdatePodSandbox request but never " +
 	"emits the PostUpdatePodSandbox event NRI defines to follow it (expected one event for " +
-	"the updated pod, observed none); CRI-O 1.38 does not implement PostUpdatePodSandbox at all"
+	"the updated pod, observed none); the runtime may not implement PostUpdatePodSandbox yet"
 
 // expectPostUpdates asserts the number of NRI PostUpdatePodSandbox events the
 // runtime delivered for podID. PostUpdatePodSandbox is an asynchronous event,
