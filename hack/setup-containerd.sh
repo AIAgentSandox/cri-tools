@@ -30,7 +30,8 @@ ENABLE_NRI="${ENABLE_NRI:-true}"
 
 echo "Setting up containerd configuration in ${CONTD_CONFIG_DIR}..."
 mkdir -p "${CONTD_CONFIG_DIR}"
-# The `io.containerd.grpc.v1.cri` schema (version = 2) is used for containerd 2.x.
+# Config version 2 is not containerd 2.x's own config version (2.3 and main are
+# at version 4), but it is still accepted and migrated on load by containerd 2.x.
 cat <<EOF > "${CONTD_CONFIG_DIR}/config.toml"
 version = 2
 [plugins]

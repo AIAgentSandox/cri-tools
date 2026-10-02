@@ -223,19 +223,24 @@ var _ = framework.KubeDescribe("Image Volume [Feature:ImageVolume]", func() {
 		// We use /bin/sh which is a standard binary present in the test image.
 		cmd := []string{"ls", "-A", containerPath + "/bin/sh"}
 
-		_, _, err = rc.ExecSync(
+		var stdout, stderr []byte
+
+		stdout, stderr, err = rc.ExecSync(
 			ctx,
 			containerID,
 			cmd,
 			time.Duration(defaultExecSyncTimeout)*time.Second,
 		)
-		framework.ExpectNoError(err, "failed to find file in image volume")
+		framework.ExpectNoError(
+			err,
+			"failed to find file in image volume: stdout: %s, stderr: %s",
+			stdout,
+			stderr,
+		)
 
 		By("Verifying the image volume is read-only")
 
 		cmd = []string{"touch", containerPath + "/test-write"}
-
-		var stderr []byte
 
 		_, stderr, err = rc.ExecSync(
 			ctx,
@@ -402,15 +407,18 @@ var _ = framework.KubeDescribe("Image Volume [Feature:ImageVolume]", func() {
 
 			cmd := []string{"ls", containerPath}
 
-			_, _, err = rc.ExecSync(
+			stdout, stderr, err := rc.ExecSync(
 				ctx,
 				containerID,
 				cmd,
 				time.Duration(defaultExecSyncTimeout)*time.Second,
 			)
-			if err != nil {
-				Skip("Image Volumes are not supported by the runtime (mount point does not exist).")
-			}
+			framework.ExpectNoError(
+				err,
+				"image volume mount point does not exist: stdout: %s, stderr: %s",
+				stdout,
+				stderr,
+			)
 
 			By("Verifying subPath was applied and not the full image root")
 			// If the runtime ignored subPath, the full image root is mounted and
@@ -433,7 +441,7 @@ var _ = framework.KubeDescribe("Image Volume [Feature:ImageVolume]", func() {
 			// With subPath="etc", /etc/passwd should appear directly at containerPath/passwd.
 			cmd = []string{"ls", containerPath + "/passwd"}
 
-			stdout, stderr, err := rc.ExecSync(
+			stdout, stderr, err = rc.ExecSync(
 				ctx,
 				containerID,
 				cmd,

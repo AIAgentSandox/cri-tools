@@ -241,9 +241,16 @@ CONTAINERD_VERSION ?= main
 RUNC_FLAVOR ?= runc
 RUNTIME ?= io.containerd.runc.v2
 
-# The --nri-socket flag is critest-specific and must not be passed to
-# other test binaries.
+# NRI is enabled by default for all supported containerd versions (2.x+).
+# ENABLE_NRI=false also skips the NRI config in hack/setup-containerd.sh, so the
+# --nri-socket flag has to be dropped along with it. The flag is
+# critest-specific and must not be passed to other test binaries.
+ENABLE_NRI ?= true
+
+NRI_FLAGS :=
+ifeq ($(ENABLE_NRI),true)
 NRI_FLAGS := --nri-socket=/var/run/nri/nri.sock
+endif
 
 # critest parallelism, mirrors CI's --parallel=8. Override via PARALLEL=N.
 PARALLEL ?= 8
