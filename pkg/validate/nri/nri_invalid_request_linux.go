@@ -196,15 +196,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				By("running a second pod sandbox with the same name, uid, namespace and attempt")
 
 				dupID, err := rc.RunPodSandbox(ctx, podConfig, framework.TestContext.RuntimeHandler)
-				if err == nil {
+				if dupID != "" {
 					podIDs = append(podIDs, dupID)
-
-					Skip("spec discrepancy: the runtime accepted RunPodSandbox with metadata " +
-						"(name/uid/namespace/attempt) identical to the existing sandbox " + podID +
-						" and created sandbox " + dupID + ". The CRI metadata is expected to uniquely " +
-						"identify a sandbox, so a duplicate request should be rejected before any " +
-						"NRI hook runs; containerd and CRI-O reject it by reserving the sandbox name.")
 				}
+
+				// The CRI metadata uniquely identifies a sandbox, so the runtime MUST
+				// reject the duplicate request before any NRI hook runs.
+				Expect(err).To(HaveOccurred(),
+					"RunPodSandbox with metadata (name/uid/namespace/attempt) identical to the "+
+						"existing sandbox %q MUST fail, got sandbox %q", podID, dupID)
 
 				expectNoNRIEventsSince(testStub.Plugin, baseline,
 					"RunPodSandbox duplicating an existing sandbox's metadata")
