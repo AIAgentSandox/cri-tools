@@ -230,6 +230,12 @@ func expectPostUpdates(
 	}
 
 	Expect(got).To(Equal(want), description)
+
+	// waitForPostUpdates stops as soon as want events are recorded, so a
+	// duplicate arriving slightly later would go unnoticed without this.
+	Consistently(func() int {
+		return plugin.postUpdateCountFor(podID)
+	}, time.Second, 100*time.Millisecond).Should(Equal(want), description)
 }
 
 // updatePodSandboxStub runs an updatePodSandboxPlugin connected to the runtime.
@@ -604,11 +610,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(updateResources(ctx, retriedOverhead, retriedResources)).NotTo(Succeed(),
 					"UpdatePodSandboxResources should fail when an NRI plugin rejects UpdatePodSandbox")
 
-				By("verifying the runtime applied no pod resources")
+				By("verifying the runtime did not apply the rejected pod resources")
 
-				_, _, applied := updatePodSandboxAppliedResources(ctx, rc, podID)
-				Expect(applied).To(BeFalse(),
-					"a rejected update must not be applied to the pod sandbox")
+				overhead, resources, applied := updatePodSandboxAppliedResources(ctx, rc, podID)
+				if applied {
+					// A runtime may report the current pod resources, which
+					// must still be the ones the sandbox was created with.
+					expectCRIResourcesMatch(resources, initialResources, "pre-update pod")
+					expectCRIResourcesMatch(overhead, initialOverhead, "pre-update overhead")
+				}
 
 				By("verifying a plugin connecting afterwards receives the old resources")
 				expectSyncedPodResources(
@@ -621,9 +631,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
 					"UpdatePodSandboxResources should succeed once the plugin accepts the update")
 				// The accepted values, not the rejected ones, are what the
-				// runtime reports as applied. This also proves the assertion
-				// above is not vacuous: the runtime does report applied pod
-				// resources, it just had none to report after the rejection.
+				// runtime reports as applied. This also proves the check above
+				// is not vacuous on a runtime that reports nothing until an
+				// update is applied: it does report applied pod resources, it
+				// just had none of the rejected ones to report.
 				expectAppliedResources(ctx, updatedOverhead, updatedResources, "updated")
 			})
 
