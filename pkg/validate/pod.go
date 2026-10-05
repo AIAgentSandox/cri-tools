@@ -412,7 +412,10 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 				framework.Logf("RunPodSandbox with a short timeout returned: %v", err)
 
 				// Mirror the kubelet: retry with the same metadata until the
-				// runtime lists a sandbox for the pod.
+				// runtime lists a sandbox for the pod. Poll tightly, because
+				// the interesting window is the one where the cancelled
+				// request is still being served: a retry landing in it is what
+				// would make a duplicate appear.
 				By("retry with the same metadata until a PodSandbox is listed")
 				Eventually(ctx, func() error {
 					pods := listTestPodSandboxes(ctx, rc, testLabel)
@@ -433,7 +436,7 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 					framework.Logf("Retried RunPodSandbox returned: %v", err)
 
 					return errors.New("no PodSandbox listed yet")
-				}).WithTimeout(time.Minute).WithPolling(time.Second).Should(Succeed())
+				}).WithTimeout(time.Minute).WithPolling(100 * time.Millisecond).Should(Succeed())
 
 				By("verify that no second PodSandbox appears later")
 				Consistently(ctx, func() []*runtimeapi.PodSandbox {
