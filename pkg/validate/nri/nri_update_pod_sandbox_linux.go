@@ -631,10 +631,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(updateResources(ctx, updatedOverhead, updatedResources)).To(Succeed(),
 					"UpdatePodSandboxResources should succeed once the plugin accepts the update")
 				// The accepted values, not the rejected ones, are what the
-				// runtime reports as applied. This also proves the check above
-				// is not vacuous on a runtime that reports nothing until an
-				// update is applied: it does report applied pod resources, it
-				// just had none of the rejected ones to report.
+				// runtime reports as applied. This also shows the check above
+				// really did test something on a runtime that reports nothing
+				// until an update is applied: it does report applied pod
+				// resources, it just had none of the rejected ones to report.
 				expectAppliedResources(ctx, updatedOverhead, updatedResources, "updated")
 			})
 
