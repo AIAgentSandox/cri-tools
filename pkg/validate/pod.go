@@ -285,13 +285,9 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 		}
 
 		// runWithSameMetadata runs a PodSandbox with the metadata shared by
-		// the tests below, bounding the request with its own deadline. A
-		// runtime may answer a request whose metadata is already used by an
-		// in-flight RunPodSandbox by waiting for that request to finish
-		// instead of replying right away, and the client default deadline for
-		// RunPodSandbox is ten minutes, which is longer than the whole suite
-		// is allowed to run. A request that does not return in time simply did
-		// not succeed, which the contract above allows.
+		// the tests below, using a dedicated timeout to avoid blocking on an
+		// in-flight request with the same metadata. A request that does not
+		// return in time simply did not succeed, which the contract allows.
 		const sameMetadataTimeout = 10 * time.Second
 
 		runWithSameMetadata := func(ctx context.Context) (string, error) {
