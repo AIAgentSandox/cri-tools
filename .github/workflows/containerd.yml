@@ -380,7 +380,7 @@ jobs:
           SKIP="exec with tty=true and stdin=true"
           critest --runtime-endpoint=npipe:////./pipe/containerd-containerd --ginkgo.focus="${FOCUS}" --ginkgo.skip="${SKIP}" --report-dir="${REPORT_DIR}" --report-prefix="windows"
           TEST_RC=$?
-          test $TEST_RC -ne 0 && cat ${REPORT_DIR}/containerd.log
+          test $TEST_RC -ne 0 && cat ${REPORT_DIR}/containerd-cri.log
           set -o errexit
           kill -9 $pid
           echo "CONTD_CRI_DIR=$REPORT_DIR" >> $GITHUB_ENV
