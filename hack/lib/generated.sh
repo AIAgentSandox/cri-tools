@@ -20,6 +20,16 @@
 # so the committed state is what gets verified. On a dirty working tree only
 # the paths in GENERATED_PATHS are checked, so verification works while there
 # are uncommitted changes.
+#
+# Set VERIFY_REQUIRE_CLEAN to require a clean working tree up front instead of
+# falling back to the generated paths only. CI sets it, so an unexpectedly
+# dirty checkout there fails loudly rather than silently weakening the check.
+
+# require_clean succeeds when VERIFY_REQUIRE_CLEAN asks for a clean working
+# tree. An empty value or 0 leaves the requirement off.
+require_clean() {
+    [[ -n "${VERIFY_REQUIRE_CLEAN:-}" && "${VERIFY_REQUIRE_CLEAN}" != 0 ]]
+}
 
 # snapshot_paths prints a git tree hash of the working tree content of the
 # given paths, including uncommitted and untracked files. It works on a copy
@@ -36,11 +46,19 @@ snapshot_paths() {
 
 # verify_generated runs the given command and fails if it modified the tree:
 # any file when the tree was clean, otherwise the paths in GENERATED_PATHS.
+# A dirty tree is an error when VERIFY_REQUIRE_CLEAN is set.
 verify_generated() {
     local status
     status=$(git status --porcelain) || exit 1
     if [[ -z "$status" ]]; then
         verify_generated_clean "$@"
+    elif require_clean; then
+        echo "tree is dirty before regeneration, please commit all changes"
+        echo "(VERIFY_REQUIRE_CLEAN is set, unset it to only check" \
+            "${GENERATED_PATHS[*]})"
+        echo ""
+        echo "$status"
+        exit 1
     else
         verify_generated_dirty "$@"
     fi

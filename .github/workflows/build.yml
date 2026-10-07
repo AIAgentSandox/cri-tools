@@ -45,6 +45,10 @@ jobs:
           go-version-file: go.mod
           cache: false
       - run: make verify-${{ matrix.run }}
+        env:
+          # The CI checkout is clean, so verify the committed state and fail
+          # if anything dirtied the tree before regeneration.
+          VERIFY_REQUIRE_CLEAN: "1"
 
   test:
     name: test / crictl

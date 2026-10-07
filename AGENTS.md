@@ -22,6 +22,10 @@ Before completing any task, agents **must** verify their changes by running `mak
 
 Failure to run these checks may result in CI failures.
 
+`verify-docs` and `verify-go-modules` only check the files they regenerate, so
+they work on a dirty tree. Set `VERIFY_REQUIRE_CLEAN=1` to require a clean
+working tree instead and verify the committed state, as CI does.
+
 ### Adding dependencies
 
 If your patch depends on new packages, add that package to the `go.mod` file,
