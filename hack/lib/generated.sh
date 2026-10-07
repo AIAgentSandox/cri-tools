@@ -14,8 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Helpers to verify that generated files are up to date without requiring
-# the whole working tree to be clean.
+# Helpers to verify that generated files are up to date.
+#
+# On a clean working tree the whole tree must stay clean after regeneration,
+# so the committed state is what gets verified. On a dirty working tree only
+# the paths in GENERATED_PATHS are checked, so verification works while there
+# are uncommitted changes.
 
 # snapshot_paths prints a git tree hash of the working tree content of the
 # given paths, including uncommitted and untracked files. It works on a copy
@@ -30,9 +34,37 @@ snapshot_paths() {
     GIT_INDEX_FILE="$SNAPSHOT_INDEX" git write-tree
 }
 
-# verify_generated runs the given command and fails if it modified any of
-# the paths listed in GENERATED_PATHS.
+# verify_generated runs the given command and fails if it modified the tree:
+# any file when the tree was clean, otherwise the paths in GENERATED_PATHS.
 verify_generated() {
+    local status
+    status=$(git status --porcelain) || exit 1
+    if [[ -z "$status" ]]; then
+        verify_generated_clean "$@"
+    else
+        verify_generated_dirty "$@"
+    fi
+}
+
+# verify_generated_clean runs the given command and fails if the working tree
+# is no longer clean afterwards.
+verify_generated_clean() {
+    local status
+    "$@"
+    status=$(git status --porcelain) || exit 1
+    if [[ -z "$status" ]]; then
+        echo "tree is clean"
+    else
+        echo "tree is dirty, please commit all changes"
+        echo ""
+        echo "$status"
+        exit 1
+    fi
+}
+
+# verify_generated_dirty runs the given command and fails if it modified any
+# of the paths listed in GENERATED_PATHS.
+verify_generated_dirty() {
     local before after
     SNAPSHOT_INDEX=$(mktemp) || exit 1
     trap 'rm -f "$SNAPSHOT_INDEX"' EXIT
