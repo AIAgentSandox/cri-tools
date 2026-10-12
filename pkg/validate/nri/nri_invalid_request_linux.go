@@ -172,12 +172,18 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			By("running a pod sandbox without metadata")
 
-			podID := framework.RunPodSandboxError(ctx, rc, &runtimeapi.PodSandboxConfig{
+			// The runtime is called directly instead of through
+			// framework.RunPodSandboxError so that a sandbox ID returned by a
+			// runtime which wrongly accepts the request is still recorded for
+			// cleanup before the assertion fails the spec.
+			podID, err := rc.RunPodSandbox(ctx, &runtimeapi.PodSandboxConfig{
 				Labels: framework.DefaultPodLabels,
-			})
+			}, framework.TestContext.RuntimeHandler)
 			if podID != "" {
 				podIDs = append(podIDs, podID)
 			}
+
+			Expect(err).To(HaveOccurred(), "RunPodSandbox without metadata MUST fail")
 
 			expectNoNRIEventsSince(testStub.Plugin, baseline,
 				"RunPodSandbox without metadata")
