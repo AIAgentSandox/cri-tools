@@ -67,6 +67,15 @@ else
     echo "NRI disabled for containerd ${CONTAINERD_VERSION}; skipping NRI configuration."
 fi
 
+# The plugin chain mirrors the config containerd's script/setup/install-cni
+# writes, which is what CI runs with: bridge plus portmap, nothing else. The
+# firewall plugin must not be added back: its chain setup is not atomic (the
+# CNI plugins only tolerate the "chain exists" exit status of the iptables
+# legacy backend, not the nft one), so the parallel sandbox creations of
+# critest --parallel=8 intermittently fail with
+# "CHAIN_USER_ADD failed (File exists): chain CNI-FORWARD". Its rules are
+# redundant here anyway, as the filter FORWARD policy inside the test
+# container is ACCEPT.
 echo "Setting up CNI networking in ${CNI_CONFIG_DIR}..."
 mkdir -p "${CNI_CONFIG_DIR}"
 cat <<EOF > "${CNI_CONFIG_DIR}/10-containerd-net.conflist"
@@ -91,9 +100,7 @@ cat <<EOF > "${CNI_CONFIG_DIR}/10-containerd-net.conflist"
     {
       "type": "portmap",
       "capabilities": { "portMappings": true }
-    },
-    { "type": "firewall" },
-    { "type": "tuning" }
+    }
   ]
 }
 EOF
