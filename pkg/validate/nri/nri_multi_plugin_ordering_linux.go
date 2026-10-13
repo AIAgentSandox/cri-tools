@@ -18,6 +18,7 @@ package nri
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -53,27 +54,6 @@ func (r *multiPluginOrderingRecorder) snapshot() []string {
 	return slices.Clone(r.entries)
 }
 
-// multiPluginOrderingSandboxListed reports whether the sandbox with the given
-// ID is returned by ListPodSandbox.
-func multiPluginOrderingSandboxListed(
-	ctx context.Context,
-	rc internalapi.RuntimeService,
-	podID string,
-) (bool, error) {
-	pods, err := rc.ListPodSandbox(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-
-	for _, pod := range pods {
-		if pod.GetId() == podID {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
 var _ = framework.KubeDescribe("NRI", func() {
 	f := framework.NewDefaultCRIFramework()
 
@@ -94,27 +74,27 @@ var _ = framework.KubeDescribe("NRI", func() {
 		)
 
 		var (
-			stubs       []*NRITestStub
-			releaseHigh func()
-			runDone     chan struct{}
-			runPodID    string
-			hookPodID   string
-			hookPodIDMu sync.Mutex
+			stubs        []*NRITestStub
+			releaseHooks []func()
+			runDone      chan struct{}
+			runPodID     string
+			hookPodID    string
+			hookPodIDMu  sync.Mutex
 		)
 
 		BeforeEach(func() {
 			stubs = nil
-			releaseHigh = nil
+			releaseHooks = nil
 			runDone = nil
 			runPodID = ""
 			hookPodID = ""
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			// Release the blocked hook first so a pending RunPodSandbox call
+			// Release every blocked hook first so a pending RunPodSandbox call
 			// can complete before the sandbox is torn down.
-			if releaseHigh != nil {
-				releaseHigh()
+			for _, release := range releaseHooks {
+				release()
 			}
 
 			// Capture fallback sandbox IDs before the stubs reset their events.
@@ -160,30 +140,53 @@ var _ = framework.KubeDescribe("NRI", func() {
 			"should invoke RunPodSandbox hooks of all plugins in index order and "+
 				"not return or list the sandbox until the last plugin completes",
 			func(ctx SpecContext) {
-				// Spec (NRI pod sandbox lifecycle, "Multi-Plugin Coordination"):
-				// hooks execute in plugin index order, and all RunPodSandbox hooks
-				// complete before the sandbox is made available.
+				// Spec (NRI pod sandbox lifecycle, "Multi-Plugin Coordination"),
+				// draft in https://github.com/containerd/nri/pull/286 (not merged
+				// yet): hooks execute in plugin index order, and all RunPodSandbox
+				// hooks complete before the first workload container starts.
+				//
+				// The draft's RunPodSandbox section only requires that the sandbox
+				// is not Ready while the hooks run (it describes the pod as being in
+				// the "unknown state"); it does not say the sandbox must not be
+				// listed. The not-listed assertion below is therefore stricter than
+				// the draft, and matches the existing single-plugin RunPodSandbox
+				// contract test in nri_run_pod_contract_linux.go.
 				recorder := &multiPluginOrderingRecorder{}
 
+				lowReached := make(chan struct{})
+				lowRelease := make(chan struct{})
 				highReached := make(chan struct{})
 				highRelease := make(chan struct{})
 
-				var releaseOnce sync.Once
+				var releaseLowOnce, releaseHighOnce sync.Once
 
-				releaseHigh = func() { releaseOnce.Do(func() { close(highRelease) }) }
+				releaseLow := func() { releaseLowOnce.Do(func() { close(lowRelease) }) }
+				releaseHigh := func() { releaseHighOnce.Do(func() { close(highRelease) }) }
+				releaseHooks = []func(){releaseLow, releaseHigh}
+
+				var lowReachedOnce, highReachedOnce sync.Once
 
 				// Hooks are installed through the configure callback so they are in
 				// place before the plugin connects to the runtime.
+				//
+				// Both hooks block: holding the lower-index hook open lets the test
+				// assert that the higher-index hook is not entered meanwhile, which a
+				// non-blocking hook could not distinguish from parallel dispatch.
 				lowHook := func(p *NRITestPlugin) {
-					p.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
+					p.OnRunPodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
 						recorder.record(lowIdxPluginName + ":enter")
+						lowReachedOnce.Do(func() { close(lowReached) })
+
+						select {
+						case <-lowRelease:
+						case <-hookCtx.Done():
+						}
+
 						recorder.record(lowIdxPluginName + ":exit")
 
 						return nil
 					}
 				}
-
-				var highReachedOnce sync.Once
 
 				highHook := func(p *NRITestPlugin) {
 					p.OnRunPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
@@ -195,12 +198,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 						highReachedOnce.Do(func() { close(highReached) })
 
+						// Record the two outcomes separately: if the runtime abandons
+						// the hook because its NRI plugin request timeout expired, the
+						// blocked-state assertions below would otherwise report a
+						// contract violation for what is really a timing problem.
 						select {
 						case <-highRelease:
+							recorder.record(highIdxPluginName + ":exit")
 						case <-hookCtx.Done():
+							recorder.record(highIdxPluginName + ":timeout")
 						}
-
-						recorder.record(highIdxPluginName + ":exit")
 
 						return nil
 					}
@@ -257,9 +264,36 @@ var _ = framework.KubeDescribe("NRI", func() {
 					)
 				}()
 
-				By("waiting for the higher-index plugin to receive RunPodSandbox")
-				Eventually(highReached, 30*time.Second).Should(BeClosed(),
-					"plugin %s (index 11) should receive the RunPodSandbox hook", highIdxPluginName)
+				// Watch done as well so a RunPodSandbox failure is reported with its
+				// own error instead of being hidden behind a hook-invocation timeout.
+				waitForHook := func(reached <-chan struct{}, pluginName string) {
+					select {
+					case <-reached:
+					case <-done:
+						Fail(fmt.Sprintf(
+							"RunPodSandbox returned before the %s hook was reached: %v",
+							pluginName, runErr))
+					case <-time.After(30 * time.Second):
+						Fail("plugin " + pluginName + " did not receive the RunPodSandbox hook")
+					}
+				}
+
+				By("waiting for the lower-index plugin to receive RunPodSandbox")
+				waitForHook(lowReached, lowIdxPluginName)
+
+				By("verifying the higher-index plugin is not entered while the " +
+					"lower-index plugin is blocking")
+				// The window must stay well below the runtime's NRI plugin request
+				// timeout (2s by default in containerd); each plugin call gets its
+				// own timeout, so this does not eat into the higher-index plugin's
+				// budget.
+				Consistently(highReached, 300*time.Millisecond).ShouldNot(BeClosed(),
+					"the higher-index plugin's RunPodSandbox hook MUST NOT be invoked "+
+						"while the lower-index plugin's hook is still in progress")
+
+				By("releasing the lower-index plugin and waiting for the higher-index plugin")
+				releaseLow()
+				waitForHook(highReached, highIdxPluginName)
 
 				By("verifying both plugins received RunPodSandbox in index order")
 				Expect(recorder.snapshot()).To(Equal([]string{
@@ -281,10 +315,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 				// request timeout (2s by default in containerd), after which the
 				// blocked hook is abandoned and RunPodSandbox proceeds.
 				Consistently(func(g Gomega) {
+					// Check this first so an expired plugin request timeout is
+					// reported as such rather than as a contract violation.
+					g.Expect(recorder.snapshot()).NotTo(
+						ContainElement(highIdxPluginName+":timeout"),
+						"runtime timed out the plugin before the observation window ended")
+
 					g.Expect(done).NotTo(BeClosed(),
 						"RunPodSandbox MUST NOT return while a plugin's RunPodSandbox hook is in progress")
 
-					listed, err := multiPluginOrderingSandboxListed(ctx, rc, blockedPodID)
+					listed, err := sandboxListed(ctx, rc, blockedPodID)
 					g.Expect(err).NotTo(HaveOccurred())
 					g.Expect(listed).To(BeFalse(),
 						"sandbox %s MUST NOT be listed while a plugin's RunPodSandbox hook is in progress",
@@ -298,7 +338,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 							Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
 							"sandbox MUST NOT report Ready while a plugin's RunPodSandbox hook is in progress")
 					}
-				}, time.Second, 100*time.Millisecond).Should(Succeed())
+				}, 500*time.Millisecond, 100*time.Millisecond).Should(Succeed())
 
 				By("releasing the higher-index plugin and verifying RunPodSandbox completes")
 				releaseHigh()
