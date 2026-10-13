@@ -46,36 +46,34 @@ if [ "${RUNC_FLAVOR}" != "runc" ]; then
 fi
 IMAGE_NAME="containerd-local-test:${IMAGE_TAG}"
 
-# Build the runner image, tagged per containerd version so it is cached and
-# reused on subsequent runs. Skip the build when the tagged image already
-# exists locally unless FORCE_REBUILD is set. A changed CONTAINERD_VERSION /
+# Build the runner image, tagged per containerd version so its layers are
+# cached and reused on subsequent runs. A changed CONTAINERD_VERSION /
 # RUNC_FLAVOR produces a new tag, so it builds a fresh image rather than
-# reusing the cached one.
-if [ -z "${FORCE_REBUILD:-}" ] && docker image inspect "${IMAGE_NAME}" >/dev/null 2>&1; then
-    echo "Reusing cached image ${IMAGE_NAME} (set FORCE_REBUILD=1 to rebuild)..."
-else
-    # The Dockerfile clones containerd and checks out CONTAINERD_VERSION in
-    # cached layers, so for a moving ref (e.g. main) a plain rebuild would reuse
-    # the previously fetched commit. FORCE_REBUILD must therefore bypass the
-    # layer cache (--no-cache) and refresh the base images (--pull) so the image
-    # is rebuilt against the current ref, matching CI which always checks out
-    # fresh.
-    BUILD_FLAGS=()
-    if [ -n "${FORCE_REBUILD:-}" ]; then
-        BUILD_FLAGS+=(--no-cache --pull)
-    fi
-    # Extract Go version from go.mod, mirroring CI's go-version-file approach.
-    GO_VERSION="$(grep '^go ' go.mod | awk '{print $2}')"
-
-    echo "Building the containerd local test image ${IMAGE_NAME}..."
-    docker build \
-        "${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}" \
-        --build-arg "GO_VERSION=${GO_VERSION}" \
-        --build-arg "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
-        --build-arg "RUNC_FLAVOR=${RUNC_FLAVOR}" \
-        -t "${IMAGE_NAME}" \
-        -f images/containerd-local-test/Dockerfile .
+# reusing the cached one. The build always runs, because the image bakes in the
+# setup scripts: skipping it whenever the tag already exists would keep running
+# a stale copy of them after they change. With nothing changed every layer is
+# cached and the build is a no-op.
+#
+# The Dockerfile clones containerd and checks out CONTAINERD_VERSION in cached
+# layers, so for a moving ref (e.g. main) a cached build reuses the previously
+# fetched commit. FORCE_REBUILD must therefore bypass the layer cache
+# (--no-cache) and refresh the base images (--pull) so the image is rebuilt
+# against the current ref, matching CI which always checks out fresh.
+BUILD_FLAGS=()
+if [ -n "${FORCE_REBUILD:-}" ]; then
+    BUILD_FLAGS+=(--no-cache --pull)
 fi
+# Extract Go version from go.mod, mirroring CI's go-version-file approach.
+GO_VERSION="$(grep '^go ' go.mod | awk '{print $2}')"
+
+echo "Building the containerd local test image ${IMAGE_NAME}..."
+docker build \
+    "${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"}" \
+    --build-arg "GO_VERSION=${GO_VERSION}" \
+    --build-arg "CONTAINERD_VERSION=${CONTAINERD_VERSION}" \
+    --build-arg "RUNC_FLAVOR=${RUNC_FLAVOR}" \
+    -t "${IMAGE_NAME}" \
+    -f images/containerd-local-test/Dockerfile .
 
 # If no command is provided, default to critest
 if [ $# -eq 0 ]; then
