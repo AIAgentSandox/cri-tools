@@ -245,9 +245,9 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 	// RemovePodSandbox. A duplicate request must either fail or return the ID
 	// of the existing sandbox.
 	//
-	// The tests are not tagged [Conformance] yet, because api.proto does not
-	// state the rule; the tag belongs here once the CRI API change that makes
-	// it a MUST has merged.
+	// TODO: The tests are not tagged [Conformance] yet, because api.proto does
+	// not state the rule; the tag belongs here once the CRI API change that
+	// makes it a MUST has merged.
 	Context("runtime should enforce PodSandbox metadata uniqueness", func() {
 		var (
 			podSandboxName string
@@ -289,14 +289,8 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 		}
 
 		// runWithSameMetadata runs a PodSandbox with the metadata shared by
-		// the tests below. The deadline matches the one the kubelet uses for
-		// RunPodSandbox, so that it never cuts off the request that actually
-		// creates the sandbox: a runtime may well need more than a few
-		// seconds (VM based runtimes, pause image not pulled yet, parallel
-		// critest runs). Requests that lose the race may block until the
-		// winner is done, because some runtimes keep them waiting for the
-		// metadata instead of rejecting them right away, so callers that
-		// issue concurrent requests cancel the context once one succeeded.
+		// the tests below, using the deadline the kubelet uses for
+		// RunPodSandbox.
 		const sameMetadataTimeout = 2 * time.Minute
 
 		runWithSameMetadata := func(ctx context.Context) (string, error) {
@@ -319,9 +313,6 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 			Expect(listTestPodSandboxes(ctx, rc, testLabel)).To(HaveLen(1), explain)
 		}
 
-		// expectOnePodSandboxConsistently verifies that the runtime lists
-		// exactly one PodSandbox and keeps doing so, which catches a
-		// duplicate created by a request the test no longer waits for.
 		expectOnePodSandboxConsistently := func(ctx context.Context) {
 			Consistently(ctx, func() []*runtimeapi.PodSandbox {
 				return listTestPodSandboxes(ctx, rc, testLabel)
@@ -340,12 +331,9 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 
 				By("run a PodSandbox with the same metadata while the first one is stopped")
 				stopPodSandbox(ctx, rc, firstID)
-				// Succeeding here returns a NOTREADY sandbox, which the
-				// RunPodSandbox wording in api.proto does not allow ("Runtimes
-				// must ensure the sandbox is in the ready state on success"),
-				// while CRI-O does exactly that today. The test accepts it
-				// because the kubelet only needs the metadata to stay taken,
-				// so the CRI API change has to carve this case out.
+				// Both failing and returning the stopped sandbox's ID are
+				// accepted; the test only verifies that no new sandbox is
+				// started.
 				runDuplicate(ctx, firstID, "metadata of a stopped PodSandbox must not be reused")
 
 				By("run a PodSandbox with attempt 1")
@@ -395,9 +383,6 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 
 				By("run PodSandboxes with the same metadata concurrently")
 
-				// The losing requests may wait for the metadata to be
-				// released, which does not happen before RemovePodSandbox,
-				// so stop waiting for them once one request succeeded.
 				runCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 
@@ -444,10 +429,6 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 			func(ctx SpecContext) {
 				By("run a PodSandbox with a client timeout shorter than sandbox creation")
 
-				// Build the config before the deadline starts. It makes a
-				// RuntimeConfig call, which would otherwise eat into the
-				// budget and could make RunPodSandbox fail client side
-				// without ever reaching the runtime.
 				config := newConfig(ctx, uid, 0)
 
 				shortCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
