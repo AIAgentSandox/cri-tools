@@ -150,12 +150,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 			podID       string
 			podConfig   *runtimeapi.PodSandboxConfig
 			containerID string
+			// podRemoved records that the spec already removed its sandbox, so
+			// AfterEach does not fall back to the hook-recorded ID and try again.
+			podRemoved bool
 		)
 
 		BeforeEach(func() {
 			gate = newPluginTimeoutGate()
 			podID = ""
 			containerID = ""
+			podRemoved = false
 		})
 
 		AfterEach(func(ctx SpecContext) {
@@ -166,7 +170,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 			gate.unblock()
 
 			cleanupID := podID
-			if cleanupID == "" && testStub != nil {
+			if cleanupID == "" && !podRemoved && testStub != nil {
 				cleanupID = testStub.Plugin.LastRunPodSandboxID()
 			}
 
@@ -485,7 +489,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				removedID := podID
 				// Clear podID so AfterEach does not stop/remove it again.
-				podID = ""
+				podID, podRemoved = "", true
 
 				pods, listErr := rc.ListPodSandbox(ctx, nil)
 				Expect(listErr).NotTo(HaveOccurred())
@@ -542,7 +546,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				removedID := podID
 				// Clear podID so AfterEach does not stop/remove it again.
-				podID = ""
+				podID, podRemoved = "", true
 
 				pods, listErr := rc.ListPodSandbox(ctx, nil)
 				Expect(listErr).NotTo(HaveOccurred())
