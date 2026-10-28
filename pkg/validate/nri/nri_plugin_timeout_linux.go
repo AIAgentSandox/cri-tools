@@ -18,7 +18,7 @@ package nri
 
 import (
 	"context"
-	"maps"
+	"fmt"
 	"sync"
 	"time"
 
@@ -33,24 +33,20 @@ import (
 )
 
 const (
-	// pluginTimeoutLabelKey labels every sandbox created by the plugin timeout
-	// specs so AfterEach can find and remove any sandbox a failed or
-	// timed-out CRI call may have left behind.
-	pluginTimeoutLabelKey = "cri-tools.nri-plugin-timeout"
+	// pluginTimeoutCallTimeout bounds how long a CRI call may take while an
+	// NRI hook never responds. Runtimes enforce a much smaller NRI plugin
+	// request timeout (containerd's plugin_request_timeout defaults to 2s),
+	// so 30s leaves ample room for that timeout plus the non-NRI work of the
+	// call (sandbox setup and teardown, container creation). A call still
+	// pending after that means the runtime is waiting on the plugin instead of
+	// enforcing its own timeout.
+	pluginTimeoutCallTimeout = 30 * time.Second
 
-	// pluginTimeoutMaxRequestTimeout bounds the runtime NRI request timeout the
-	// specs are willing to wait out. The timeout is read from the value the
-	// runtime advertises to the plugin during Configure (containerd's
-	// plugin_request_timeout, default 2s); larger values would make the specs
-	// needlessly slow, so they are skipped instead.
-	pluginTimeoutMaxRequestTimeout = 30 * time.Second
-
-	// pluginTimeoutCallSlack is the extra time, on top of the runtime NRI
-	// request timeout, a CRI call is given to return once a hook stops
-	// responding. It covers the non-NRI work of the call (sandbox setup and
-	// teardown, container creation). A call still pending after that is treated
-	// as the runtime waiting on the plugin beyond its own request timeout.
-	pluginTimeoutCallSlack = 60 * time.Second
+	// pluginTimeoutSlowHookDelay is how long the "slow but in time" hook
+	// delays its reply. It must stay below the NRI plugin request timeout of
+	// every runtime under test (containerd: 2s), so that the runtime does not
+	// time the hook out.
+	pluginTimeoutSlowHookDelay = time.Second
 
 	// pluginTimeoutHookSafetyBound caps how long a blocking hook waits for the
 	// test to release it, so a hook can never outlive the spec indefinitely
@@ -61,7 +57,9 @@ const (
 // pluginTimeoutGate blocks the first hook invocation routed through it until
 // released, simulating an unresponsive plugin. It deliberately ignores the
 // hook context so that the runtime, not the plugin, must enforce the request
-// timeout. Subsequent invocations (e.g. retries) pass through immediately.
+// timeout. Subsequent invocations (e.g. retries, or a redelivered idempotent
+// stop) pass through immediately, matching the sync.Once guard the other NRI
+// contract specs use around their blocking hooks.
 type pluginTimeoutGate struct {
 	first       sync.Once
 	releaseOnce sync.Once
@@ -108,23 +106,15 @@ func (g *pluginTimeoutGate) unblock() {
 	g.releaseOnce.Do(func() { close(g.release) })
 }
 
-// pluginTimeoutPodConfig returns a pod sandbox config carrying a unique label
-// value that identifies the sandbox for leak checks and cleanup.
+// pluginTimeoutPodConfig builds a pod sandbox config for the given sandbox name.
 func pluginTimeoutPodConfig(
 	ctx context.Context,
 	rc internalapi.RuntimeService,
-	namePrefix, labelValue string,
+	podSandboxName string,
 ) *runtimeapi.PodSandboxConfig {
-	labels := maps.Clone(framework.DefaultPodLabels)
-	if labels == nil {
-		labels = map[string]string{}
-	}
-
-	labels[pluginTimeoutLabelKey] = labelValue
-
 	return &runtimeapi.PodSandboxConfig{
 		Metadata: framework.BuildPodSandboxMetadata(
-			namePrefix+framework.NewUUID(),
+			podSandboxName,
 			framework.DefaultUIDPrefix+framework.NewUUID(),
 			framework.DefaultNamespacePrefix+framework.NewUUID(),
 			framework.DefaultAttempt,
@@ -132,39 +122,8 @@ func pluginTimeoutPodConfig(
 		Linux: &runtimeapi.LinuxPodSandboxConfig{
 			CgroupParent: common.GetCgroupParent(ctx, rc),
 		},
-		Labels: labels,
+		Labels: framework.DefaultPodLabels,
 	}
-}
-
-// pluginTimeoutListSandboxes lists the sandboxes carrying the given label value.
-func pluginTimeoutListSandboxes(
-	ctx context.Context,
-	rc internalapi.RuntimeService,
-	labelValue string,
-) ([]*runtimeapi.PodSandbox, error) {
-	return rc.ListPodSandbox(ctx, &runtimeapi.PodSandboxFilter{
-		LabelSelector: map[string]string{pluginTimeoutLabelKey: labelValue},
-	})
-}
-
-// pluginTimeoutRequestTimeout returns the NRI request timeout the runtime
-// advertised to the stub, skipping the spec when it is unknown or too large.
-func pluginTimeoutRequestTimeout(testStub *NRITestStub) time.Duration {
-	timeout := testStub.Stub.RequestTimeout()
-	if timeout <= 0 {
-		Skip("runtime did not advertise an NRI plugin request timeout during Configure; " +
-			"cannot derive how long a hook must block to exceed it")
-	}
-
-	if timeout > pluginTimeoutMaxRequestTimeout {
-		Skip("runtime NRI plugin request timeout " + timeout.String() +
-			" exceeds " + pluginTimeoutMaxRequestTimeout.String() +
-			"; skipping to keep the plugin timeout specs fast")
-	}
-
-	framework.Logf("runtime NRI plugin request timeout: %v", timeout)
-
-	return timeout
 }
 
 var _ = framework.KubeDescribe("NRI", func() {
@@ -186,43 +145,55 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 	Context("plugin timeout", Serial, func() {
 		var (
-			testStub   *NRITestStub
-			gate       *pluginTimeoutGate
-			labelValue string
+			testStub    *NRITestStub
+			gate        *pluginTimeoutGate
+			podID       string
+			podConfig   *runtimeapi.PodSandboxConfig
+			containerID string
 		)
 
 		BeforeEach(func() {
 			gate = newPluginTimeoutGate()
-			labelValue = framework.NewUUID()
+			podID = ""
+			containerID = ""
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			// Release any hook still blocked, then disconnect the plugin so
-			// the cleanup CRI calls below cannot be held up by it.
+			// Release any hook still blocked, then capture the fallback
+			// sandbox ID before cleanup resets the recorded events: a CRI call
+			// that failed on a hook timeout never returned an ID, so the hook
+			// event is the only record of the sandbox the runtime attempted.
 			gate.unblock()
 
+			cleanupID := podID
+			if cleanupID == "" && testStub != nil {
+				cleanupID = testStub.Plugin.LastRunPodSandboxID()
+			}
+
+			// Stop the stub first so the cleanup CRI calls below cannot be
+			// held up by a hook that is still unresponsive.
 			if testStub != nil {
 				testStub.Cleanup()
 				testStub = nil
 			}
 
-			// Remove every sandbox created by the spec, including any left
-			// behind by a failed or timed-out CRI call. RemovePodSandbox
-			// also removes the sandbox's containers.
-			pods, err := pluginTimeoutListSandboxes(ctx, rc, labelValue)
-			if err != nil {
-				framework.Logf("AfterEach: ListPodSandbox failed: %v", err)
-
-				return
-			}
-
-			for _, pod := range pods {
-				if err := rc.StopPodSandbox(ctx, pod.GetId()); err != nil {
-					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", pod.GetId(), err)
+			if containerID != "" {
+				if err := rc.StopContainer(ctx, containerID, 0); err != nil {
+					framework.Logf("AfterEach: StopContainer(%s) failed: %v", containerID, err)
 				}
 
-				if err := rc.RemovePodSandbox(ctx, pod.GetId()); err != nil {
-					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", pod.GetId(), err)
+				if err := rc.RemoveContainer(ctx, containerID); err != nil {
+					framework.Logf("AfterEach: RemoveContainer(%s) failed: %v", containerID, err)
+				}
+			}
+
+			if cleanupID != "" {
+				if err := rc.StopPodSandbox(ctx, cleanupID); err != nil {
+					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", cleanupID, err)
+				}
+
+				if err := rc.RemovePodSandbox(ctx, cleanupID); err != nil {
+					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", cleanupID, err)
 				}
 			}
 		})
@@ -239,48 +210,53 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-timeout-run", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				requestTimeout := pluginTimeoutRequestTimeout(testStub)
-
 				testStub.Plugin.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
 					return gate.block()
 				}
 
-				podConfig := pluginTimeoutPodConfig(ctx, rc, "nri-test-timeout-run-", labelValue)
+				By("building the pod sandbox config")
 
-				By(
-					"running a pod sandbox while the RunPodSandbox hook blocks past the request timeout",
-				)
+				podSandboxName := "nri-test-timeout-run-" + framework.NewUUID()
+				podConfig = pluginTimeoutPodConfig(ctx, rc, podSandboxName)
 
-				callCtx, cancel := context.WithTimeout(ctx, requestTimeout+pluginTimeoutCallSlack)
+				By("running a pod sandbox while the RunPodSandbox hook stops responding")
+
+				callCtx, cancel := context.WithTimeout(ctx, pluginTimeoutCallTimeout)
 				defer cancel()
 
-				podID, runErr := rc.RunPodSandbox(
+				runPodID, runErr := rc.RunPodSandbox(
 					callCtx,
 					podConfig,
 					framework.TestContext.RuntimeHandler,
 				)
 				callTimedOut := callCtx.Err() != nil
 
+				// Release the hook so the stub no longer holds up the runtime.
 				gate.unblock()
 
 				Expect(gate.wasReached()).To(BeTrue(), "RunPodSandbox NRI hook was not invoked")
 				Expect(callTimedOut).To(BeFalse(),
-					"RunPodSandbox did not return within %v; the runtime must not wait on the plugin "+
-						"beyond its NRI request timeout (%v)", requestTimeout+pluginTimeoutCallSlack, requestTimeout)
+					"RunPodSandbox did not return within %v; the runtime MUST NOT wait on an "+
+						"unresponsive plugin beyond its NRI plugin request timeout",
+					pluginTimeoutCallTimeout)
 
 				if runErr == nil {
 					// Runtime policy: the plugin timeout did not fail pod
-					// creation (containerd closes the timed-out plugin and
-					// proceeds). The sandbox must then be fully usable.
+					// creation. containerd treats the timeout as a fatal plugin
+					// error, closes the timed-out plugin and lets the CRI call
+					// proceed. The sandbox must then be fully usable.
+					podID = runPodID
+					Expect(podID).NotTo(BeEmpty())
+
 					framework.Logf(
 						"RunPodSandbox succeeded despite the hook timeout (runtime policy): %s",
 						podID,
 					)
 
-					status, statusErr := rc.PodSandboxStatus(ctx, podID, false)
+					statusResp, statusErr := rc.PodSandboxStatus(ctx, podID, false)
 					Expect(statusErr).NotTo(HaveOccurred())
 					Expect(
-						status.GetStatus().GetState(),
+						statusResp.GetStatus().GetState(),
 					).To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
 						"sandbox created despite a hook timeout must be ready")
 
@@ -288,23 +264,50 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				framework.Logf("RunPodSandbox failed after the hook timeout: %v", runErr)
+				Expect(runPodID).To(BeEmpty(),
+					"No pod sandbox ID should be returned when RunPodSandbox fails")
 
-				By("verifying the failed RunPodSandbox did not leak a sandbox")
-				Eventually(func() ([]*runtimeapi.PodSandbox, error) {
-					return pluginTimeoutListSandboxes(ctx, rc, labelValue)
+				By("verifying the NRI RunPodSandbox hook actually fired")
+				// The hook records its event before blocking, so the attempted
+				// sandbox ID is available for the leak check below.
+				attemptedID := testStub.Plugin.LastRunPodSandboxID()
+				Expect(attemptedID).NotTo(BeEmpty(),
+					"NRI RunPodSandbox hook should have fired before the failure")
+
+				By("verifying the failed RunPodSandbox is not left behind")
+				// The runtime may unwind the sandbox asynchronously after
+				// returning the error, so poll instead of listing once.
+				Eventually(func() []string {
+					pods, listErr := rc.ListPodSandbox(ctx, nil)
+					Expect(listErr).NotTo(HaveOccurred())
+
+					var leaked []string
+
+					for _, pod := range pods {
+						if pod.GetId() == attemptedID ||
+							pod.GetMetadata().GetName() == podSandboxName {
+							leaked = append(leaked, pod.GetId())
+						}
+					}
+
+					return leaked
 				}, 30*time.Second, 500*time.Millisecond).Should(BeEmpty(),
 					"a RunPodSandbox that failed due to a plugin timeout MUST NOT leave a sandbox behind")
 
-				By("retrying RunPodSandbox with the same config")
+				By("retrying RunPodSandbox once the plugin responds in time")
 
-				retryPodID, retryErr := rc.RunPodSandbox(
-					ctx,
-					podConfig,
-					framework.TestContext.RuntimeHandler,
-				)
-				Expect(retryErr).NotTo(HaveOccurred(),
+				podID = framework.RunPodSandbox(ctx, rc, podConfig)
+				Expect(podID).NotTo(BeEmpty(),
 					"RunPodSandbox retry should succeed once the plugin responds in time")
-				Expect(retryPodID).NotTo(BeEmpty())
+
+				By("verifying the retried sandbox becomes Ready")
+
+				statusResp, statusErr := rc.PodSandboxStatus(ctx, podID, false)
+				Expect(statusErr).NotTo(HaveOccurred())
+				Expect(
+					statusResp.GetStatus().GetState(),
+				).To(Equal(runtimeapi.PodSandboxState_SANDBOX_READY),
+					"sandbox should become Ready after a successful RunPodSandbox retry")
 			},
 		)
 
@@ -316,12 +319,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-timeout-create", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				requestTimeout := pluginTimeoutRequestTimeout(testStub)
-
 				By("creating a pod sandbox")
 
-				podConfig := pluginTimeoutPodConfig(ctx, rc, "nri-test-timeout-create-", labelValue)
-				podID := framework.RunPodSandbox(ctx, rc, podConfig)
+				podConfig = pluginTimeoutPodConfig(
+					ctx,
+					rc,
+					"nri-test-timeout-create-"+framework.NewUUID(),
+				)
+				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
 
 				framework.PullPublicImage(
@@ -331,9 +336,10 @@ var _ = framework.KubeDescribe("NRI", func() {
 					nil,
 				)
 
+				containerName := "nri-test-timeout-create-ctr-" + framework.NewUUID()
 				containerConfig := &runtimeapi.ContainerConfig{
 					Metadata: framework.BuildContainerMetadata(
-						"nri-test-timeout-create-ctr-"+framework.NewUUID(),
+						containerName,
 						framework.DefaultAttempt,
 					),
 					Image: &runtimeapi.ImageSpec{
@@ -349,35 +355,40 @@ var _ = framework.KubeDescribe("NRI", func() {
 					return gate.block()
 				}
 
-				By(
-					"creating a container while the CreateContainer hook blocks past the request timeout",
-				)
+				By("creating a container while the CreateContainer hook stops responding")
 
-				callCtx, cancel := context.WithTimeout(ctx, requestTimeout+pluginTimeoutCallSlack)
+				callCtx, cancel := context.WithTimeout(ctx, pluginTimeoutCallTimeout)
 				defer cancel()
 
-				containerID, createErr := framework.CreateContainerWithError(
+				createdID, createErr := framework.CreateContainerWithError(
 					callCtx, rc, ic, containerConfig, podID, podConfig,
 				)
 				callTimedOut := callCtx.Err() != nil
 
+				// Release the hook so the stub no longer holds up the runtime.
 				gate.unblock()
 
 				Expect(gate.wasReached()).To(BeTrue(), "CreateContainer NRI hook was not invoked")
 				Expect(callTimedOut).To(BeFalse(),
-					"CreateContainer did not return within %v; the runtime must not wait on the plugin "+
-						"beyond its NRI request timeout (%v)", requestTimeout+pluginTimeoutCallSlack, requestTimeout)
+					"CreateContainer did not return within %v; the runtime MUST NOT wait on an "+
+						"unresponsive plugin beyond its NRI plugin request timeout",
+					pluginTimeoutCallTimeout)
 
 				if createErr == nil {
+					// Runtime policy: the plugin timeout did not fail container
+					// creation (see the RunPodSandbox spec above).
+					containerID = createdID
+					Expect(containerID).NotTo(BeEmpty())
+
 					framework.Logf(
 						"CreateContainer succeeded despite the hook timeout (runtime policy): %s",
 						containerID,
 					)
 
-					status, statusErr := rc.ContainerStatus(ctx, containerID, false)
+					statusResp, statusErr := rc.ContainerStatus(ctx, containerID, false)
 					Expect(statusErr).NotTo(HaveOccurred())
 					Expect(
-						status.GetStatus().GetState(),
+						statusResp.GetStatus().GetState(),
 					).To(Equal(runtimeapi.ContainerState_CONTAINER_CREATED),
 						"container created despite a hook timeout must be in CREATED state")
 
@@ -385,21 +396,35 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}
 
 				framework.Logf("CreateContainer failed after the hook timeout: %v", createErr)
+				Expect(createdID).To(BeEmpty(),
+					"No container ID should be returned when CreateContainer fails")
 
-				By("verifying the failed CreateContainer did not leak a container")
-				Eventually(func() ([]*runtimeapi.Container, error) {
-					return rc.ListContainers(ctx, &runtimeapi.ContainerFilter{PodSandboxId: podID})
-				}, 30*time.Second, 500*time.Millisecond).Should(BeEmpty(),
-					"a CreateContainer that failed due to a plugin timeout MUST NOT leave a container behind")
+				By("verifying the failed CreateContainer leaked no container")
 
-				By("retrying CreateContainer with the same config")
+				containers, listErr := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
+					PodSandboxId: podID,
+				})
+				Expect(listErr).NotTo(HaveOccurred(), "ListContainers after failed CreateContainer")
 
-				retryID, retryErr := framework.CreateContainerWithError(
+				for _, c := range containers {
+					if c.GetMetadata().GetName() == containerName {
+						containerID = c.GetId() // hand to AfterEach for cleanup
+						Fail(
+							fmt.Sprintf(
+								"container %s was leaked after a CreateContainer that timed out on the plugin",
+								c.GetId(),
+							),
+						)
+					}
+				}
+
+				By("retrying CreateContainer with the same name")
+
+				containerID = framework.CreateContainer(
 					ctx, rc, ic, containerConfig, podID, podConfig,
 				)
-				Expect(retryErr).NotTo(HaveOccurred(),
+				Expect(containerID).NotTo(BeEmpty(),
 					"CreateContainer retry with the same name should succeed once the plugin responds in time")
-				Expect(retryID).NotTo(BeEmpty())
 			},
 		)
 
@@ -414,41 +439,43 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-timeout-stop", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				requestTimeout := pluginTimeoutRequestTimeout(testStub)
-
 				By("creating a pod sandbox")
 
-				podConfig := pluginTimeoutPodConfig(ctx, rc, "nri-test-timeout-stop-", labelValue)
-				podID := framework.RunPodSandbox(ctx, rc, podConfig)
+				podConfig = pluginTimeoutPodConfig(
+					ctx,
+					rc,
+					"nri-test-timeout-stop-"+framework.NewUUID(),
+				)
+				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
 
 				testStub.Plugin.OnStopPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
 					return gate.block()
 				}
 
-				By(
-					"stopping the sandbox while the StopPodSandbox hook blocks past the request timeout",
-				)
+				By("stopping the sandbox while the StopPodSandbox hook stops responding")
 
-				callCtx, cancel := context.WithTimeout(ctx, requestTimeout+pluginTimeoutCallSlack)
+				callCtx, cancel := context.WithTimeout(ctx, pluginTimeoutCallTimeout)
 				defer cancel()
 
 				stopErr := rc.StopPodSandbox(callCtx, podID)
 				callTimedOut := callCtx.Err() != nil
 
+				// Release the hook so the stub no longer holds up the runtime.
 				gate.unblock()
 
 				Expect(gate.wasReached()).To(BeTrue(), "StopPodSandbox NRI hook was not invoked")
 				Expect(callTimedOut).To(BeFalse(),
-					"StopPodSandbox did not return within %v; the runtime must not wait on the plugin "+
-						"beyond its NRI request timeout (%v)", requestTimeout+pluginTimeoutCallSlack, requestTimeout)
+					"StopPodSandbox did not return within %v; the runtime MUST NOT wait on an "+
+						"unresponsive plugin beyond its NRI plugin request timeout",
+					pluginTimeoutCallTimeout)
 				Expect(stopErr).NotTo(HaveOccurred(),
 					"a StopPodSandbox hook timeout MUST NOT prevent the sandbox from being stopped")
 
-				status, statusErr := rc.PodSandboxStatus(ctx, podID, false)
+				statusResp, statusErr := rc.PodSandboxStatus(ctx, podID, false)
 				Expect(statusErr).NotTo(HaveOccurred())
 				Expect(
-					status.GetStatus().GetState(),
+					statusResp.GetStatus().GetState(),
 				).To(Equal(runtimeapi.PodSandboxState_SANDBOX_NOTREADY),
 					"sandbox MUST be stopped after StopPodSandbox returns")
 
@@ -456,8 +483,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred(),
 					"RemovePodSandbox should succeed after a StopPodSandbox hook timeout")
 
-				Expect(pluginTimeoutListSandboxes(ctx, rc, labelValue)).To(BeEmpty(),
-					"sandbox MUST be removed")
+				removedID := podID
+				// Clear podID so AfterEach does not stop/remove it again.
+				podID = ""
+
+				pods, listErr := rc.ListPodSandbox(ctx, nil)
+				Expect(listErr).NotTo(HaveOccurred())
+
+				for _, pod := range pods {
+					Expect(pod.GetId()).NotTo(Equal(removedID), "sandbox MUST be removed")
+				}
 			},
 		)
 
@@ -471,12 +506,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-timeout-remove", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				requestTimeout := pluginTimeoutRequestTimeout(testStub)
-
 				By("creating and stopping a pod sandbox")
 
-				podConfig := pluginTimeoutPodConfig(ctx, rc, "nri-test-timeout-remove-", labelValue)
-				podID := framework.RunPodSandbox(ctx, rc, podConfig)
+				podConfig = pluginTimeoutPodConfig(
+					ctx,
+					rc,
+					"nri-test-timeout-remove-"+framework.NewUUID(),
+				)
+				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
 				Expect(rc.StopPodSandbox(ctx, podID)).NotTo(HaveOccurred())
 
@@ -484,27 +521,35 @@ var _ = framework.KubeDescribe("NRI", func() {
 					return gate.block()
 				}
 
-				By(
-					"removing the sandbox while the RemovePodSandbox hook blocks past the request timeout",
-				)
+				By("removing the sandbox while the RemovePodSandbox hook stops responding")
 
-				callCtx, cancel := context.WithTimeout(ctx, requestTimeout+pluginTimeoutCallSlack)
+				callCtx, cancel := context.WithTimeout(ctx, pluginTimeoutCallTimeout)
 				defer cancel()
 
 				removeErr := rc.RemovePodSandbox(callCtx, podID)
 				callTimedOut := callCtx.Err() != nil
 
+				// Release the hook so the stub no longer holds up the runtime.
 				gate.unblock()
 
 				Expect(gate.wasReached()).To(BeTrue(), "RemovePodSandbox NRI hook was not invoked")
 				Expect(callTimedOut).To(BeFalse(),
-					"RemovePodSandbox did not return within %v; the runtime must not wait on the plugin "+
-						"beyond its NRI request timeout (%v)", requestTimeout+pluginTimeoutCallSlack, requestTimeout)
+					"RemovePodSandbox did not return within %v; the runtime MUST NOT wait on an "+
+						"unresponsive plugin beyond its NRI plugin request timeout",
+					pluginTimeoutCallTimeout)
 				Expect(removeErr).NotTo(HaveOccurred(),
 					"a RemovePodSandbox hook timeout MUST NOT prevent the sandbox from being removed")
 
-				Expect(pluginTimeoutListSandboxes(ctx, rc, labelValue)).To(BeEmpty(),
-					"sandbox MUST be removed")
+				removedID := podID
+				// Clear podID so AfterEach does not stop/remove it again.
+				podID = ""
+
+				pods, listErr := rc.ListPodSandbox(ctx, nil)
+				Expect(listErr).NotTo(HaveOccurred())
+
+				for _, pod := range pods {
+					Expect(pod.GetId()).NotTo(Equal(removedID), "sandbox MUST be removed")
+				}
 			},
 		)
 
@@ -516,15 +561,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				testStub, err = StartNRITestStub("cri-test-nri-timeout-slow-run", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				requestTimeout := pluginTimeoutRequestTimeout(testStub)
-
-				// Half the request timeout is clearly slow, yet leaves the
-				// other half as margin so the runtime does not time it out.
-				slowDelay := requestTimeout / 2
-
 				testStub.Plugin.OnRunPodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
 					select {
-					case <-time.After(slowDelay):
+					case <-time.After(pluginTimeoutSlowHookDelay):
 					case <-hookCtx.Done():
 					}
 
@@ -533,16 +572,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("running a pod sandbox with a slow but in-time RunPodSandbox hook")
 
-				podConfig := pluginTimeoutPodConfig(
+				podConfig = pluginTimeoutPodConfig(
 					ctx,
 					rc,
-					"nri-test-timeout-slow-run-",
-					labelValue,
+					"nri-test-timeout-slow-run-"+framework.NewUUID(),
 				)
 				start := time.Now()
-				podID := framework.RunPodSandbox(ctx, rc, podConfig)
+				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
-				Expect(time.Since(start)).To(BeNumerically(">=", slowDelay),
+				Expect(time.Since(start)).To(BeNumerically(">=", pluginTimeoutSlowHookDelay),
 					"RunPodSandbox should wait for the in-time hook to complete")
 
 				By("stopping the sandbox")
