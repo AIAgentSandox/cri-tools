@@ -193,7 +193,11 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should apply environment variable and mount adjustments to the container",
 			func(ctx SpecContext) {
-				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+				testStub.Plugin.OnCreateContainer = func(
+					_ context.Context,
+					_ *nri.PodSandbox,
+					_ *nri.Container,
+				) (*nri.ContainerAdjustment, error) {
 					adj := &nri.ContainerAdjustment{}
 					adj.AddEnv(adjustEnvKey, adjustEnvValue)
 					adj.AddMount(&nri.Mount{
@@ -203,7 +207,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 						Options:     []string{"nosuid", "nodev", "size=1m"},
 					})
 
-					return adj
+					return adj, nil
 				}
 
 				By("creating a container adjusted by the NRI plugin")
@@ -240,11 +244,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should expose an annotation adjustment through ContainerStatus",
 			func(ctx SpecContext) {
-				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+				testStub.Plugin.OnCreateContainer = func(
+					_ context.Context,
+					_ *nri.PodSandbox,
+					_ *nri.Container,
+				) (*nri.ContainerAdjustment, error) {
 					adj := &nri.ContainerAdjustment{}
 					adj.AddAnnotation(adjustAnnotationKey, adjustAnnotationVal)
 
-					return adj
+					return adj, nil
 				}
 
 				config := newContainerConfig("nri-test-adjust-annotation-")
@@ -300,11 +308,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should apply a memory limit adjustment to the container cgroup",
 			func(ctx SpecContext) {
-				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+				testStub.Plugin.OnCreateContainer = func(
+					_ context.Context,
+					_ *nri.PodSandbox,
+					_ *nri.Container,
+				) (*nri.ContainerAdjustment, error) {
 					adj := &nri.ContainerAdjustment{}
 					adj.SetLinuxMemoryLimit(adjustMemoryLimit)
 
-					return adj
+					return adj, nil
 				}
 
 				By("creating a container adjusted by the NRI plugin")
@@ -326,13 +338,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should reject a seccomp adjustment for a RuntimeDefault container when the default validator is enabled",
 			func(ctx SpecContext) {
-				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+				testStub.Plugin.OnCreateContainer = func(
+					_ context.Context,
+					_ *nri.PodSandbox,
+					_ *nri.Container,
+				) (*nri.ContainerAdjustment, error) {
 					adj := &nri.ContainerAdjustment{}
 					adj.SetLinuxSeccompPolicy(
 						&nri.LinuxSeccomp{DefaultAction: "SCMP_ACT_ALLOW"},
 					)
 
-					return adj
+					return adj, nil
 				}
 
 				config := newContainerConfig("nri-test-adjust-seccomp-")
