@@ -18,7 +18,6 @@ package validate
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -293,13 +292,17 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 		// RunPodSandbox.
 		const sameMetadataTimeout = 2 * time.Minute
 
-		runWithSameMetadata := func(ctx context.Context) (string, error) {
+		runWithSameMetadataTimeout := func(ctx context.Context, timeout time.Duration) (string, error) {
 			config := newConfig(ctx, uid, 0)
 
-			ctx, cancel := context.WithTimeout(ctx, sameMetadataTimeout)
+			ctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
 			return rc.RunPodSandbox(ctx, config, framework.TestContext.RuntimeHandler)
+		}
+
+		runWithSameMetadata := func(ctx context.Context) (string, error) {
+			return runWithSameMetadataTimeout(ctx, sameMetadataTimeout)
 		}
 
 		// runDuplicate runs a PodSandbox with metadata already used by
@@ -427,43 +430,63 @@ var _ = framework.KubeDescribe("PodSandbox", func() {
 		It(
 			"runtime should create at most one PodSandbox when retrying a timed out request",
 			func(ctx SpecContext) {
+				// A retry is bounded on its own, because a runtime may make it
+				// wait for the cancelled request it is still serving, and a
+				// single retry must not use up the whole spec. Retries are
+				// spread over a window to land in the time where that request
+				// is still being served: a retry landing in it is what would
+				// make a duplicate appear.
+				const (
+					retryTimeout = 2 * time.Second
+					retryWindow  = 5 * time.Second
+				)
+
 				By("run a PodSandbox with a client timeout shorter than sandbox creation")
 
-				config := newConfig(ctx, uid, 0)
-
-				shortCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-				_, err := rc.RunPodSandbox(shortCtx, config, framework.TestContext.RuntimeHandler)
-
-				cancel()
+				_, err := runWithSameMetadataTimeout(ctx, 100*time.Millisecond)
 				framework.Logf("RunPodSandbox with a short timeout returned: %v", err)
 
-				// Mirror the kubelet: retry with the same metadata until the
-				// runtime lists a sandbox for the pod. Poll tightly, because
-				// the interesting window is the one where the cancelled
-				// request is still being served: a retry landing in it is what
-				// would make a duplicate appear. A single retry can block for
-				// as long as the runtime takes to serve the request it waits
-				// for, hence the long overall timeout.
-				By("retry with the same metadata until a PodSandbox is listed")
-				Eventually(ctx, func() error {
+				// Mirror the kubelet, which retries with the same metadata
+				// after a timed out RunPodSandbox until the runtime lists a
+				// sandbox for the pod. How long a runtime keeps the metadata
+				// of the cancelled request reserved is up to the runtime, so a
+				// retry is not required to succeed; what must hold is that
+				// retrying never adds a second PodSandbox.
+				By("retry with the same metadata while no PodSandbox is listed")
+
+				var succeeded []string
+
+				Consistently(ctx, func() []*runtimeapi.PodSandbox {
+					if pods := listTestPodSandboxes(ctx, rc, testLabel); len(pods) > 0 {
+						return pods
+					}
+
+					id, err := runWithSameMetadataTimeout(ctx, retryTimeout)
+					framework.Logf("Retried RunPodSandbox returned %q: %v", id, err)
+
+					if err == nil {
+						succeeded = append(succeeded, id)
+					}
+
+					return listTestPodSandboxes(ctx, rc, testLabel)
+				}).WithTimeout(retryWindow).WithPolling(100*time.Millisecond).
+					Should(Or(BeEmpty(), HaveLen(1)), "retrying must not create a second PodSandbox")
+
+				By("verify that no second PodSandbox appears after the retries")
+
+				if len(succeeded) > 0 {
+					Expect(slices.Compact(slices.Sorted(slices.Values(succeeded)))).To(HaveLen(1),
+						"successful retries must all return the same PodSandbox ID")
+
 					pods := listTestPodSandboxes(ctx, rc, testLabel)
-					if len(pods) > 1 {
-						return StopTrying("runtime created more than one PodSandbox").
-							Attach("PodSandboxes", pods)
-					}
+					Expect(pods).To(HaveLen(1))
+					Expect(pods[0].GetId()).To(Equal(succeeded[0]))
+				}
 
-					if len(pods) == 1 {
-						return nil
-					}
-
-					_, err := runWithSameMetadata(ctx)
-					framework.Logf("Retried RunPodSandbox returned: %v", err)
-
-					return errors.New("no PodSandbox listed yet")
-				}).WithTimeout(sameMetadataTimeout).WithPolling(100 * time.Millisecond).Should(Succeed())
-
-				By("verify that no second PodSandbox appears later")
-				expectOnePodSandboxConsistently(ctx)
+				Consistently(ctx, func() []*runtimeapi.PodSandbox {
+					return listTestPodSandboxes(ctx, rc, testLabel)
+				}).WithTimeout(5*time.Second).WithPolling(500*time.Millisecond).
+					Should(Or(BeEmpty(), HaveLen(1)), "retrying must not create a second PodSandbox")
 			},
 		)
 	})
