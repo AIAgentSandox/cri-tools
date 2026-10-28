@@ -19,15 +19,12 @@ package nri
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	nri "github.com/containerd/nri/pkg/api"
-	"github.com/containerd/nri/pkg/stub"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	internalapi "k8s.io/cri-api/pkg/apis"
@@ -38,9 +35,6 @@ import (
 )
 
 const (
-	adjustPluginName = "cri-test-nri-adjust"
-	adjustPluginIdx  = "00"
-
 	adjustEnvKey        = "NRI_ADJUST_TEST_ENV"
 	adjustEnvValue      = "injected-by-nri"
 	adjustAnnotationKey = "cri-tools.test/nri-adjust"
@@ -53,123 +47,19 @@ const (
 	adjustExecTimeout = 10 * time.Second
 )
 
-// adjustPlugin is a minimal NRI plugin that returns a ContainerAdjustment
-// from CreateContainer. The adjustment is built by the adjust callback, so
-// each spec controls exactly which container properties are changed.
-type adjustPlugin struct {
-	mu        sync.Mutex
-	adjust    func(pod *nri.PodSandbox, ctr *nri.Container) *nri.ContainerAdjustment
-	adjusted  []string
-	ready     chan struct{}
-	readyOnce sync.Once
-}
+// adjustedContainerIDs returns the IDs of the containers for which the
+// plugin's CreateContainer hook has fired, which is where the adjustment under
+// test is returned to the runtime.
+func adjustedContainerIDs(plugin *NRITestPlugin) []string {
+	var ids []string
 
-// Synchronize implements stub.SynchronizeInterface and signals readiness.
-func (p *adjustPlugin) Synchronize(
-	_ context.Context,
-	_ []*nri.PodSandbox,
-	_ []*nri.Container,
-) ([]*nri.ContainerUpdate, error) {
-	p.readyOnce.Do(func() { close(p.ready) })
-
-	return nil, nil
-}
-
-// CreateContainer implements stub.CreateContainerInterface.
-func (p *adjustPlugin) CreateContainer(
-	_ context.Context,
-	pod *nri.PodSandbox,
-	ctr *nri.Container,
-) (*nri.ContainerAdjustment, []*nri.ContainerUpdate, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.adjust == nil {
-		return nil, nil, nil
+	for _, e := range plugin.Events() {
+		if e.Type == EventCreateContainer {
+			ids = append(ids, e.ContainerID)
+		}
 	}
 
-	p.adjusted = append(p.adjusted, ctr.GetId())
-
-	return p.adjust(pod, ctr), nil, nil
-}
-
-func (p *adjustPlugin) setAdjust(
-	fn func(*nri.PodSandbox, *nri.Container) *nri.ContainerAdjustment,
-) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.adjust = fn
-}
-
-func (p *adjustPlugin) adjustedCount() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return len(p.adjusted)
-}
-
-// adjustStub owns the lifecycle of a connected adjustPlugin.
-type adjustStub struct {
-	plugin *adjustPlugin
-	cancel context.CancelFunc
-	done   chan struct{}
-}
-
-// startAdjustStub connects an adjustPlugin to the runtime and waits until the
-// registration/Synchronize handshake has completed.
-func startAdjustStub() (*adjustStub, error) {
-	socketPath := framework.TestContext.NRISocketPath
-	if socketPath == "" {
-		return nil, errors.New("NRI socket path not configured")
-	}
-
-	plugin := &adjustPlugin{ready: make(chan struct{})}
-
-	s, err := stub.New(plugin,
-		stub.WithPluginName(adjustPluginName),
-		stub.WithPluginIdx(adjustPluginIdx),
-		stub.WithSocketPath(socketPath),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create NRI stub: %w", err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	errCh := make(chan error, 1)
-
-	go func() {
-		defer close(done)
-
-		errCh <- s.Run(ctx)
-	}()
-
-	select {
-	case <-plugin.ready:
-	case <-done:
-		cancel()
-
-		return nil, fmt.Errorf("NRI stub exited early: %w", <-errCh)
-	case <-time.After(10 * time.Second):
-		cancel()
-		s.Stop()
-
-		return nil, errors.New("NRI stub did not become ready within 10s")
-	}
-
-	return &adjustStub{plugin: plugin, cancel: cancel, done: done}, nil
-}
-
-// stop disconnects the plugin from the runtime.
-func (a *adjustStub) stop() {
-	a.cancel()
-
-	select {
-	case <-a.done:
-	case <-time.After(5 * time.Second):
-		framework.Logf("NRI adjustment stub did not stop within 5s")
-	}
+	return ids
 }
 
 // adjustExec runs cmd in the container and returns its trimmed stdout.
@@ -205,7 +95,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 	Context("container adjustment", Serial, func() {
 		var (
-			testStub    *adjustStub
+			testStub    *NRITestStub
 			podID       string
 			podConfig   *runtimeapi.PodSandboxConfig
 			containerID string
@@ -214,8 +104,8 @@ var _ = framework.KubeDescribe("NRI", func() {
 		BeforeEach(func(ctx SpecContext) {
 			var err error
 
-			testStub, err = startAdjustStub()
-			Expect(err).NotTo(HaveOccurred(), "failed to start NRI adjustment stub")
+			testStub, err = StartNRITestStub("cri-test-nri-adjust", "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
 			framework.PullPublicImage(
 				ctx,
@@ -248,7 +138,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		AfterEach(func(ctx SpecContext) {
 			// Disconnect the plugin first so its adjustments cannot affect teardown.
 			if testStub != nil {
-				testStub.stop()
+				testStub.Cleanup()
 			}
 
 			if containerID != "" {
@@ -293,7 +183,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		createAndStart := func(ctx context.Context, config *runtimeapi.ContainerConfig) {
 			containerID = framework.CreateContainer(ctx, rc, ic, config, podID, podConfig)
 
-			Expect(testStub.plugin.adjustedCount()).To(BeNumerically(">=", 1),
+			Expect(adjustedContainerIDs(testStub.Plugin)).To(ContainElement(containerID),
 				"NRI CreateContainer hook should have been invoked for the container")
 
 			By("starting the container")
@@ -303,20 +193,18 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should apply environment variable and mount adjustments to the container",
 			func(ctx SpecContext) {
-				testStub.plugin.setAdjust(
-					func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
-						adj := &nri.ContainerAdjustment{}
-						adj.AddEnv(adjustEnvKey, adjustEnvValue)
-						adj.AddMount(&nri.Mount{
-							Destination: adjustMountPath,
-							Type:        "tmpfs",
-							Source:      "tmpfs",
-							Options:     []string{"nosuid", "nodev", "size=1m"},
-						})
+				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+					adj := &nri.ContainerAdjustment{}
+					adj.AddEnv(adjustEnvKey, adjustEnvValue)
+					adj.AddMount(&nri.Mount{
+						Destination: adjustMountPath,
+						Type:        "tmpfs",
+						Source:      "tmpfs",
+						Options:     []string{"nosuid", "nodev", "size=1m"},
+					})
 
-						return adj
-					},
-				)
+					return adj
+				}
 
 				By("creating a container adjusted by the NRI plugin")
 				createAndStart(ctx, newContainerConfig("nri-test-adjust-env-mount-"))
@@ -352,14 +240,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should expose an annotation adjustment through ContainerStatus",
 			func(ctx SpecContext) {
-				testStub.plugin.setAdjust(
-					func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
-						adj := &nri.ContainerAdjustment{}
-						adj.AddAnnotation(adjustAnnotationKey, adjustAnnotationVal)
+				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+					adj := &nri.ContainerAdjustment{}
+					adj.AddAnnotation(adjustAnnotationKey, adjustAnnotationVal)
 
-						return adj
-					},
-				)
+					return adj
+				}
 
 				config := newContainerConfig("nri-test-adjust-annotation-")
 				config.Annotations = map[string]string{"cri-tools.test/original": "true"}
@@ -414,14 +300,12 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should apply a memory limit adjustment to the container cgroup",
 			func(ctx SpecContext) {
-				testStub.plugin.setAdjust(
-					func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
-						adj := &nri.ContainerAdjustment{}
-						adj.SetLinuxMemoryLimit(adjustMemoryLimit)
+				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+					adj := &nri.ContainerAdjustment{}
+					adj.SetLinuxMemoryLimit(adjustMemoryLimit)
 
-						return adj
-					},
-				)
+					return adj
+				}
 
 				By("creating a container adjusted by the NRI plugin")
 				createAndStart(ctx, newContainerConfig("nri-test-adjust-memory-"))
@@ -442,16 +326,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should reject a seccomp adjustment for a RuntimeDefault container when the default validator is enabled",
 			func(ctx SpecContext) {
-				testStub.plugin.setAdjust(
-					func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
-						adj := &nri.ContainerAdjustment{}
-						adj.SetLinuxSeccompPolicy(
-							&nri.LinuxSeccomp{DefaultAction: "SCMP_ACT_ALLOW"},
-						)
+				testStub.Plugin.AdjustContainer = func(_ *nri.PodSandbox, _ *nri.Container) *nri.ContainerAdjustment {
+					adj := &nri.ContainerAdjustment{}
+					adj.SetLinuxSeccompPolicy(
+						&nri.LinuxSeccomp{DefaultAction: "SCMP_ACT_ALLOW"},
+					)
 
-						return adj
-					},
-				)
+					return adj
+				}
 
 				config := newContainerConfig("nri-test-adjust-seccomp-")
 				config.Linux.SecurityContext = &runtimeapi.LinuxContainerSecurityContext{
@@ -482,7 +364,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				framework.Logf("CreateContainer rejected the seccomp adjustment: %v", err)
 				Expect(createdID).To(BeEmpty(),
 					"no container ID should be returned when the adjustment is rejected")
-				Expect(testStub.plugin.adjustedCount()).To(BeNumerically(">=", 1),
+				Expect(adjustedContainerIDs(testStub.Plugin)).NotTo(BeEmpty(),
 					"NRI CreateContainer hook should have been invoked before the rejection")
 
 				By("verifying the rejected container was not leaked")

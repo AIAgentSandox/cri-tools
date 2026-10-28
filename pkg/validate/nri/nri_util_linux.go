@@ -87,6 +87,12 @@ type NRITestPlugin struct {
 	OnStartContainer   func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
 	OnStopContainer    func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
 	OnRemoveContainer  func(ctx context.Context, pod *nri.PodSandbox, container *nri.Container) error
+
+	// AdjustContainer, if set, supplies the ContainerAdjustment returned from
+	// the CreateContainer hook, so tests can verify that adjustments requested
+	// by a plugin take effect. It is only called once OnCreateContainer (if
+	// set) has returned successfully.
+	AdjustContainer func(pod *nri.PodSandbox, container *nri.Container) *nri.ContainerAdjustment
 }
 
 // Synchronize implements stub.SynchronizeInterface.
@@ -195,6 +201,10 @@ func (p *NRITestPlugin) CreateContainer(
 		if err := p.OnCreateContainer(ctx, pod, container); err != nil {
 			return nil, nil, err
 		}
+	}
+
+	if p.AdjustContainer != nil {
+		return p.AdjustContainer(pod, container), nil, nil
 	}
 
 	return nil, nil, nil
