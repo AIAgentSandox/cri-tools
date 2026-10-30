@@ -53,9 +53,10 @@ const (
 func adjustedContainerIDs(plugin *NRITestPlugin) []string {
 	var ids []string
 
-	for _, e := range plugin.Events() {
-		if e.Type == EventCreateContainer {
-			ids = append(ids, e.ContainerID)
+	events := plugin.Events()
+	for i := range events {
+		if events[i].Type == EventCreateContainer {
+			ids = append(ids, events[i].ContainerID)
 		}
 	}
 
