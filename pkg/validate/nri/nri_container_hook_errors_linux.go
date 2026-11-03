@@ -324,7 +324,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 					outcome = fmt.Sprintf("CRI StartContainer failed with: %v", startErr)
 				}
 
-				Skip(fmt.Sprintf(
+				AddReportEntry("StartContainer hook error outcome", fmt.Sprintf(
 					"unspecified behavior: the NRI spec does not define the outcome of a StartContainer "+
 						"hook error. Observed: %s; container state afterwards was %s. "+
 						"Teardown (StopContainer/RemoveContainer) succeeded as required.",
