@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	nri "github.com/containerd/nri/pkg/api"
@@ -32,37 +34,87 @@ import (
 	"sigs.k8s.io/cri-tools/pkg/framework"
 )
 
-// The NRI pod sandbox lifecycle spec (containerd/nri docs/pod-sandbox-lifecycle.md,
-// "Error Handling") states that on the teardown path plugin errors MUST NOT
-// prevent the operation from proceeding, and that runtimes MUST ensure a
-// failing plugin cannot block pod or container teardown. The per-hook rules in
-// that section are spelled out for StopPodSandbox and RemovePodSandbox only;
-// the tests below apply them by analogy to the StopContainer and
-// RemoveContainer hooks. No rule is given for errors returned from the
-// StartContainer hook, so its outcome is only observed and reported.
+// These tests make an NRI plugin hook return an error for one container and
+// check what the runtime does with it. Two plugins are connected: a failing
+// one (index 00) and a healthy one after it (index 10).
 //
-// All three hooks can return an error through the NRI stub API: the stub
-// relays the handler error in the ttrpc response and the NRI adaptation
-// returns any non-fatal plugin error to the runtime, which decides how to act
-// on it. None of these events is notification-only at the protocol level.
+// Teardown hooks (StopContainer, RemoveContainer). The draft NRI pod sandbox
+// lifecycle document (containerd/nri#286 at revision 2339aa3, unmerged) states,
+// for the pod teardown hooks, that a plugin error must not block teardown. The
+// tests apply that to the container teardown hooks: the runtime still does its
+// own teardown and every other plugin still gets the hook. In addition, a
+// plugin that failed to release its per-container state must be told again,
+// so the error is returned to the CRI caller (which retries), a retry
+// redelivers the hook, and RemoveContainer does not remove the container while
+// a connected plugin keeps failing; otherwise that plugin leaks the state.
+//
+// StartContainer hook. A plugin that fails StartContainer (for example, it
+// could not set up something the container needs) must be able to keep the
+// container from running, so the CRI StartContainer call fails and the
+// container is not running. The container can still be stopped and removed,
+// and those calls deliver their hooks, so plugins can release what they
+// allocated for it.
 
-// containerHookErrorsCount returns how many events of the given type were
-// recorded by the plugin for the given container.
+const (
+	containerHookErrorsFailingPlugin = "cri-test-nri-ctr-hook-errors"
+	containerHookErrorsHealthyPlugin = "cri-test-nri-ctr-hook-errors-healthy"
+)
+
+// containerHookErrorsCount returns how many events of the given type the
+// plugin recorded for the given pod and container.
 func containerHookErrorsCount(
 	plugin *NRITestPlugin,
 	eventType NRIEventType,
-	containerID string,
+	podID, containerID string,
 ) int {
 	count := 0
 	events := plugin.Events()
 
 	for i := range events {
-		if events[i].Type == eventType && events[i].ContainerID == containerID {
+		if events[i].Type == eventType &&
+			events[i].PodSandboxID == podID &&
+			events[i].ContainerID == containerID {
 			count++
 		}
 	}
 
 	return count
+}
+
+// containerHookErrorsIndex returns the position of the first event of the
+// given type for the given pod and container in the plugin's event stream,
+// or -1 if there is none.
+func containerHookErrorsIndex(
+	plugin *NRITestPlugin,
+	eventType NRIEventType,
+	podID, containerID string,
+) int {
+	events := plugin.Events()
+
+	for i := range events {
+		if events[i].Type == eventType &&
+			events[i].PodSandboxID == podID &&
+			events[i].ContainerID == containerID {
+			return i
+		}
+	}
+
+	return -1
+}
+
+// containerHookErrorsFailFor returns a container hook that returns an error for
+// the given pod and container while fail is set, and succeeds otherwise.
+func containerHookErrorsFailFor(
+	fail *atomic.Bool,
+	podID, containerID, hook string,
+) func(context.Context, *nri.PodSandbox, *nri.Container) error {
+	return func(_ context.Context, pod *nri.PodSandbox, ctr *nri.Container) error {
+		if fail.Load() && pod.GetId() == podID && ctr.GetId() == containerID {
+			return errors.New("induced NRI " + hook + " failure")
+		}
+
+		return nil
+	}
 }
 
 // containerHookErrorsFindContainer returns the container with the given ID
@@ -88,6 +140,20 @@ func containerHookErrorsFindContainer(
 	return nil, nil
 }
 
+// containerHookErrorsSkipDeviations skips the spec with the recorded runtime
+// deviations, if any. Call it after every other assertion and the cleanup.
+func containerHookErrorsSkipDeviations(deviations []string) {
+	if len(deviations) > 0 {
+		Skip("spec discrepancy: " + strings.Join(deviations, "; "))
+	}
+}
+
+const containerHookErrorsT2Deviation = "healthy plugin %s (index 10) did not get the %s hook " +
+	"after plugin %s (index 00) returned an error from it. Expected: a plugin error never blocks " +
+	"teardown, so every other plugin still gets the hook, in index order (containerd/nri#286 at " +
+	"2339aa3, unmerged draft, \"Error Handling\"). Observed: delivery stopped at the failing plugin. " +
+	"Tracking: containerd/nri#274"
+
 var _ = framework.KubeDescribe("NRI", func() {
 	f := framework.NewDefaultCRIFramework()
 
@@ -107,17 +173,26 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 	Context("container hook errors", Serial, func() {
 		var (
-			testStub    *NRITestStub
+			failingStub *NRITestStub
+			healthyStub *NRITestStub
 			podID       string
 			podConfig   *runtimeapi.PodSandboxConfig
 			containerID string
+			// fail turns the failing plugin's hook error on and off. Cleared
+			// before the cleanup so the teardown can complete.
+			fail atomic.Bool
 		)
 
 		BeforeEach(func(ctx SpecContext) {
 			var err error
 
-			testStub, err = StartNRITestStub("cri-test-nri-ctr-hook-errors", "00")
-			Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
+			fail.Store(false)
+
+			failingStub, err = StartNRITestStub(containerHookErrorsFailingPlugin, "00")
+			Expect(err).NotTo(HaveOccurred(), "failed to start the failing NRI test stub")
+
+			healthyStub, err = StartNRITestStub(containerHookErrorsHealthyPlugin, "10")
+			Expect(err).NotTo(HaveOccurred(), "failed to start the healthy NRI test stub")
 
 			framework.PullPublicImage(
 				ctx,
@@ -171,10 +246,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		AfterEach(func(ctx SpecContext) {
-			// Stop the stub first so a still-failing hook cannot interfere with
-			// teardown of the container or sandbox.
-			if testStub != nil {
-				testStub.Cleanup()
+			// Stop the hook error and disconnect the stubs first, so a still
+			// failing hook cannot interfere with teardown.
+			fail.Store(false)
+
+			if failingStub != nil {
+				failingStub.Cleanup()
+			}
+
+			if healthyStub != nil {
+				healthyStub.Cleanup()
 			}
 
 			if containerID != "" {
@@ -199,138 +280,289 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		It(
-			"should stop the container when the StopContainer hook returns an error",
+			"should report a StopContainer hook error, stop the container and redeliver the hook on retry",
 			func(ctx SpecContext) {
-				testStub.Plugin.OnStopContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
-					return errors.New("induced NRI StopContainer failure")
-				}
+				ctrID := containerID
+				failing := failingStub.Plugin
+				healthy := healthyStub.Plugin
+				failing.OnStopContainer = containerHookErrorsFailFor(
+					&fail,
+					podID,
+					ctrID,
+					"StopContainer",
+				)
+
+				var deviations []string
 
 				By("starting the container")
-				Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
+				Expect(rc.StartContainer(ctx, ctrID)).To(Succeed())
 
 				By("stopping the container while the StopContainer hook is failing")
-				Expect(rc.StopContainer(ctx, containerID, 0)).NotTo(HaveOccurred(),
-					"StopContainer MUST succeed even when the NRI StopContainer hook returns an error")
+				fail.Store(true)
 
-				By("verifying the NRI StopContainer hook fired")
-				Eventually(func() int {
-					return containerHookErrorsCount(
-						testStub.Plugin,
+				stopErr := rc.StopContainer(ctx, ctrID, 0)
+				failedDeliveries := containerHookErrorsCount(
+					failing,
+					EventStopContainer,
+					podID,
+					ctrID,
+				)
+				Expect(failedDeliveries).To(BeNumerically(">=", 1),
+					"the failing plugin must get the StopContainer hook for the container before the call returns")
+
+				By("verifying the container reached the EXITED state despite the hook error")
+				Eventually(func(g Gomega) {
+					resp, err := rc.ContainerStatus(ctx, ctrID, false)
+					g.Expect(err).NotTo(HaveOccurred(), "ContainerStatus after StopContainer")
+					g.Expect(resp.GetStatus().GetState()).
+						To(Equal(runtimeapi.ContainerState_CONTAINER_EXITED),
+							"the runtime must still stop the container when a StopContainer hook returns an error")
+				}, 30*time.Second, 200*time.Millisecond).Should(Succeed())
+
+				By("verifying the healthy plugin also got the StopContainer hook")
+
+				if containerHookErrorsCount(healthy, EventStopContainer, podID, ctrID) == 0 {
+					deviations = append(deviations, fmt.Sprintf(
+						containerHookErrorsT2Deviation,
+						containerHookErrorsHealthyPlugin,
+						"StopContainer",
+						containerHookErrorsFailingPlugin,
+					))
+				}
+
+				if stopErr != nil {
+					framework.Logf("StopContainer returned the hook error: %v", stopErr)
+
+					By("retrying StopContainer while the hook still fails")
+					Expect(rc.StopContainer(ctx, ctrID, 0)).NotTo(Succeed(),
+						"a retried StopContainer must keep returning an error while a plugin's StopContainer hook fails")
+					Expect(containerHookErrorsCount(failing, EventStopContainer, podID, ctrID)).
+						To(BeNumerically(">", failedDeliveries),
+							"a retried StopContainer must redeliver the hook to the plugin that failed it")
+
+					failedDeliveries = containerHookErrorsCount(
+						failing,
 						EventStopContainer,
-						containerID,
+						podID,
+						ctrID,
 					)
-				}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1),
-					"NRI StopContainer hook should have fired for the container")
 
-				By("verifying the container reached the EXITED state")
-				Eventually(func() runtimeapi.ContainerState {
-					resp, err := rc.ContainerStatus(ctx, containerID, false)
-					Expect(err).NotTo(HaveOccurred(), "ContainerStatus after StopContainer")
+					By("retrying StopContainer after the hook stops failing")
+					fail.Store(false)
+					Expect(rc.StopContainer(ctx, ctrID, 0)).To(Succeed(),
+						"StopContainer must succeed once every plugin's StopContainer hook succeeds")
+					Expect(containerHookErrorsCount(failing, EventStopContainer, podID, ctrID)).
+						To(BeNumerically(">", failedDeliveries),
+							"the successful retry must redeliver the hook to the plugin that failed it")
+				} else {
+					// TODO: link the containerd issue for swallowed teardown hook errors once filed.
+					deviations = append(deviations, "StopContainer succeeded although plugin "+
+						containerHookErrorsFailingPlugin+" returned an error from its StopContainer hook. "+
+						"Expected: the CRI call returns an error so the caller retries, and the retry "+
+						"redelivers the hook to the plugin that failed. Observed: the runtime dropped the "+
+						"plugin error and returned success, so the hook is never redelivered. Rationale: a "+
+						"plugin that failed to release its per-container state must be told again, or it leaks "+
+						"that state. No runtime issue filed yet")
+				}
 
-					return resp.GetStatus().GetState()
-				}, 30*time.Second, 200*time.Millisecond).Should(Equal(runtimeapi.ContainerState_CONTAINER_EXITED),
-					"container MUST reach EXITED even when the NRI StopContainer hook returns an error")
+				By("cleaning up the container")
+				fail.Store(false)
+				Expect(rc.RemoveContainer(ctx, ctrID)).To(Succeed())
+
+				containerID = ""
+
+				containerHookErrorsSkipDeviations(deviations)
 			},
 		)
 
 		It(
-			"should remove the container when the RemoveContainer hook returns an error",
+			"should report a RemoveContainer hook error and keep the container until the hook succeeds",
 			func(ctx SpecContext) {
-				testStub.Plugin.OnRemoveContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
-					return errors.New("induced NRI RemoveContainer failure")
-				}
+				ctrID := containerID
+				failing := failingStub.Plugin
+				healthy := healthyStub.Plugin
+				failing.OnRemoveContainer = containerHookErrorsFailFor(
+					&fail,
+					podID,
+					ctrID,
+					"RemoveContainer",
+				)
+
+				var deviations []string
 
 				By("starting and stopping the container")
-				Expect(rc.StartContainer(ctx, containerID)).NotTo(HaveOccurred())
-				Expect(rc.StopContainer(ctx, containerID, 0)).NotTo(HaveOccurred())
+				Expect(rc.StartContainer(ctx, ctrID)).To(Succeed())
+				Expect(rc.StopContainer(ctx, ctrID, 0)).To(Succeed())
 
 				By("removing the container while the RemoveContainer hook is failing")
-				Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred(),
-					"RemoveContainer MUST succeed even when the NRI RemoveContainer hook returns an error")
+				fail.Store(true)
 
-				removedID := containerID
-				// The container is gone; clear so AfterEach does not touch it again.
-				containerID = ""
+				removeErr := rc.RemoveContainer(ctx, ctrID)
+				failedDeliveries := containerHookErrorsCount(
+					failing,
+					EventRemoveContainer,
+					podID,
+					ctrID,
+				)
+				Expect(failedDeliveries).To(BeNumerically(">=", 1),
+					"the failing plugin must get the RemoveContainer hook for the container before the call returns")
 
-				By("verifying the NRI RemoveContainer hook fired")
-				Eventually(func() int {
-					return containerHookErrorsCount(
-						testStub.Plugin,
+				By("verifying the healthy plugin also got the RemoveContainer hook")
+
+				if containerHookErrorsCount(healthy, EventRemoveContainer, podID, ctrID) == 0 {
+					deviations = append(deviations, fmt.Sprintf(
+						containerHookErrorsT2Deviation,
+						containerHookErrorsHealthyPlugin,
+						"RemoveContainer",
+						containerHookErrorsFailingPlugin,
+					))
+				}
+
+				listed, err := containerHookErrorsFindContainer(ctx, rc, podID, ctrID)
+				Expect(err).NotTo(HaveOccurred(), "ListContainers after RemoveContainer")
+
+				if removeErr != nil {
+					framework.Logf("RemoveContainer returned the hook error: %v", removeErr)
+
+					By("verifying the container is still listed while the hook fails")
+					Expect(listed).NotTo(BeNil(),
+						"the container must stay listed while a connected plugin's RemoveContainer hook fails")
+
+					By("retrying RemoveContainer while the hook still fails")
+					Expect(rc.RemoveContainer(ctx, ctrID)).NotTo(Succeed(),
+						"a retried RemoveContainer must keep returning an error while a plugin's RemoveContainer hook fails")
+					Expect(containerHookErrorsCount(failing, EventRemoveContainer, podID, ctrID)).
+						To(BeNumerically(">", failedDeliveries),
+							"a retried RemoveContainer must redeliver the hook to the plugin that failed it")
+
+					listed, err = containerHookErrorsFindContainer(ctx, rc, podID, ctrID)
+					Expect(
+						err,
+					).NotTo(HaveOccurred(), "ListContainers after the retried RemoveContainer")
+					Expect(listed).NotTo(BeNil(),
+						"the container must stay listed while a connected plugin's RemoveContainer hook fails")
+
+					failedDeliveries = containerHookErrorsCount(
+						failing,
 						EventRemoveContainer,
-						removedID,
+						podID,
+						ctrID,
 					)
-				}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1),
-					"NRI RemoveContainer hook should have fired for the container")
+
+					By("retrying RemoveContainer after the hook stops failing")
+					fail.Store(false)
+					Expect(rc.RemoveContainer(ctx, ctrID)).To(Succeed(),
+						"RemoveContainer must succeed once every plugin's RemoveContainer hook succeeds")
+					Expect(containerHookErrorsCount(failing, EventRemoveContainer, podID, ctrID)).
+						To(BeNumerically(">", failedDeliveries),
+							"the successful retry must redeliver the hook to the plugin that failed it")
+				} else {
+					observed := "the container was removed"
+					if listed != nil {
+						observed = "the container is still listed"
+					}
+
+					// TODO: link the containerd issue for swallowed teardown hook errors once filed.
+					deviations = append(deviations, "RemoveContainer succeeded although plugin "+
+						containerHookErrorsFailingPlugin+" returned an error from its RemoveContainer hook. "+
+						"Expected: the CRI call returns an error and the container stays listed until every "+
+						"connected plugin's RemoveContainer hook succeeds, and a retry redelivers the hook. "+
+						"Observed: the runtime dropped the plugin error and returned success; "+observed+". "+
+						"Rationale: a plugin that failed to release its per-container state must be told "+
+						"again, or it leaks that state. No runtime issue filed yet")
+				}
 
 				By("verifying the container is no longer listed")
+				fail.Store(false)
+				Expect(rc.RemoveContainer(ctx, ctrID)).To(Succeed(),
+					"RemoveContainer on a removed container must succeed (CRI: idempotent remove)")
 
-				c, err := containerHookErrorsFindContainer(ctx, rc, podID, removedID)
+				listed, err = containerHookErrorsFindContainer(ctx, rc, podID, ctrID)
 				Expect(err).NotTo(HaveOccurred(), "ListContainers after RemoveContainer")
-				Expect(c).To(BeNil(),
-					"container MUST NOT be listed after RemoveContainer, even when the NRI RemoveContainer hook returns an error")
+				Expect(
+					listed,
+				).To(BeNil(), "container must not be listed after a successful RemoveContainer")
+
+				containerID = ""
+
+				containerHookErrorsSkipDeviations(deviations)
 			},
 		)
 
 		It(
-			"should report the outcome when the StartContainer hook returns an error",
+			"should fail StartContainer when the StartContainer hook returns an error",
 			func(ctx SpecContext) {
-				testStub.Plugin.OnStartContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
-					return errors.New("induced NRI StartContainer failure")
-				}
+				ctrID := containerID
+				failing := failingStub.Plugin
+				healthy := healthyStub.Plugin
+				failing.OnStartContainer = containerHookErrorsFailFor(
+					&fail,
+					podID,
+					ctrID,
+					"StartContainer",
+				)
 
 				By("starting the container while the StartContainer hook is failing")
+				fail.Store(true)
 
-				startErr := rc.StartContainer(ctx, containerID)
+				startErr := rc.StartContainer(ctx, ctrID)
+				Expect(startErr).To(HaveOccurred(),
+					"StartContainer must fail when a plugin's StartContainer hook returns an error")
+				framework.Logf("StartContainer returned: %v", startErr)
+				Expect(containerHookErrorsCount(failing, EventStartContainer, podID, ctrID)).
+					To(BeNumerically(">=", 1),
+						"the failing plugin must get the StartContainer hook for the container")
 
-				By("verifying the NRI StartContainer hook fired")
-				Eventually(func() int {
-					return containerHookErrorsCount(
-						testStub.Plugin,
-						EventStartContainer,
-						containerID,
-					)
-				}, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1),
-					"NRI StartContainer hook should have fired for the container")
+				By("verifying the container is not running")
 
-				By("observing the container state after StartContainer")
+				resp, err := rc.ContainerStatus(ctx, ctrID, false)
+				Expect(err).NotTo(HaveOccurred(), "ContainerStatus after the failed StartContainer")
+				Expect(
+					resp.GetStatus().GetState(),
+				).NotTo(Equal(runtimeapi.ContainerState_CONTAINER_RUNNING),
+					"the container must not be running after StartContainer failed")
 
-				resp, err := rc.ContainerStatus(ctx, containerID, false)
-				Expect(err).NotTo(HaveOccurred(), "ContainerStatus after StartContainer")
+				By("stopping and removing the container")
+				Expect(rc.StopContainer(ctx, ctrID, 0)).To(Succeed(),
+					"StopContainer must succeed after a failed StartContainer")
+				Expect(rc.RemoveContainer(ctx, ctrID)).To(Succeed(),
+					"RemoveContainer must succeed after a failed StartContainer")
 
-				observedState := resp.GetStatus().GetState()
-
-				By("verifying the container can still be stopped and removed")
-				// Whatever the start outcome, teardown MUST NOT be blocked: the
-				// container must remain stoppable and removable. The StartContainer
-				// hook keeps failing, but it is not on the teardown path.
-				Expect(rc.StopContainer(ctx, containerID, 0)).NotTo(HaveOccurred(),
-					"StopContainer MUST succeed after a StartContainer NRI hook error")
-				Expect(rc.RemoveContainer(ctx, containerID)).NotTo(HaveOccurred(),
-					"RemoveContainer MUST succeed after a StartContainer NRI hook error")
-
-				removedID := containerID
 				containerID = ""
 
-				c, err := containerHookErrorsFindContainer(ctx, rc, podID, removedID)
+				listed, err := containerHookErrorsFindContainer(ctx, rc, podID, ctrID)
 				Expect(err).NotTo(HaveOccurred(), "ListContainers after RemoveContainer")
-				Expect(c).To(BeNil(), "container MUST NOT be listed after RemoveContainer")
+				Expect(listed).To(BeNil(), "container must not be listed after RemoveContainer")
 
-				// The spec does not define whether a StartContainer hook error must
-				// fail the CRI StartContainer call or which state the container is
-				// left in (the closest rule, for RunPodSandbox, leaves it to runtime
-				// policy). Report what the runtime did instead of asserting it.
-				outcome := "CRI StartContainer succeeded (the plugin error was ignored)"
-				if startErr != nil {
-					outcome = fmt.Sprintf("CRI StartContainer failed with: %v", startErr)
+				By(
+					"verifying both plugins got the StopContainer and RemoveContainer hooks in order",
+				)
+
+				for _, p := range []struct {
+					name   string
+					plugin *NRITestPlugin
+				}{
+					{containerHookErrorsFailingPlugin, failing},
+					{containerHookErrorsHealthyPlugin, healthy},
+				} {
+					create := containerHookErrorsIndex(p.plugin, EventCreateContainer, podID, ctrID)
+					stop := containerHookErrorsIndex(p.plugin, EventStopContainer, podID, ctrID)
+					remove := containerHookErrorsIndex(p.plugin, EventRemoveContainer, podID, ctrID)
+
+					Expect(create).To(BeNumerically(">=", 0),
+						"plugin %s must have got CreateContainer for the container", p.name)
+					Expect(stop).To(BeNumerically(">", create),
+						"plugin %s must get StopContainer after CreateContainer for the container "+
+							"whose start failed (events: %v)", p.name, p.plugin.Events())
+					Expect(remove).To(BeNumerically(">", stop),
+						"plugin %s must get RemoveContainer after StopContainer for the container "+
+							"whose start failed (events: %v)", p.name, p.plugin.Events())
 				}
 
-				AddReportEntry("StartContainer hook error outcome", fmt.Sprintf(
-					"unspecified behavior: the NRI spec does not define the outcome of a StartContainer "+
-						"hook error. Observed: %s; container state afterwards was %s. "+
-						"Teardown (StopContainer/RemoveContainer) succeeded as required.",
-					outcome,
-					observedState,
-				))
+				start := containerHookErrorsIndex(failing, EventStartContainer, podID, ctrID)
+				Expect(start).To(BeNumerically("<",
+					containerHookErrorsIndex(failing, EventStopContainer, podID, ctrID)),
+					"the failing plugin must get StartContainer before StopContainer")
 			},
 		)
 	})
