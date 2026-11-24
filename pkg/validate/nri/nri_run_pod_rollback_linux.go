@@ -21,7 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"time"
+	"sync/atomic"
 
 	nri "github.com/containerd/nri/pkg/api"
 	. "github.com/onsi/ginkgo/v2"
@@ -34,11 +34,15 @@ import (
 )
 
 const (
-	// rollbackObserveTimeout bounds how long the tests wait for teardown
-	// notifications of a rolled-back object. Runtimes deliver them (if at all)
-	// while unwinding the failed CRI call, so a short window is sufficient.
-	rollbackObserveTimeout = 5 * time.Second
-	rollbackObservePoll    = 200 * time.Millisecond
+	// rollbackRationale is the expectation behind every rollback assertion in
+	// this file, with the issue that asked for it.
+	rollbackRationale = "a plugin whose create hook ran must be told, before the CRI call returns, " +
+		"that the object was rolled back, or it leaks whatever it allocated for it " +
+		"(https://github.com/kubernetes-sigs/cri-tools/issues/2046)"
+
+	// rollbackRetryRationale is the expectation behind the same-metadata retry.
+	rollbackRetryRationale = "a failed create must leave nothing behind, so an immediate retry with " +
+		"the same metadata succeeds"
 )
 
 var _ = framework.KubeDescribe("NRI", func() {
@@ -58,6 +62,16 @@ var _ = framework.KubeDescribe("NRI", func() {
 		ic = f.CRIClient.CRIImageClient
 	})
 
+	// When a create fails after some plugin's create hook was entered, every
+	// plugin whose hook was entered, including the one that failed, gets the
+	// matching teardown in order before the CRI call returns. The reason: a
+	// plugin that allocated on RunPodSandbox or CreateContainer must be told
+	// when the object is rolled back, or it leaks. See
+	// https://github.com/kubernetes-sigs/cri-tools/issues/2046.
+	//
+	// The teardown is checked on a snapshot of the events taken right when the
+	// CRI call returns, and at least once each: a failed create is not a
+	// successful operation, so a repeated rollback teardown is allowed.
 	Context("RunPodSandbox rollback", Serial, func() {
 		var (
 			stubs []*NRITestStub
@@ -89,8 +103,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 
+		registerPod := func(id string) {
+			if id != "" && !slices.Contains(podIDs, id) {
+				podIDs = append(podIDs, id)
+			}
+		}
+
 		It(
-			"should notify a plugin that accepted RunPodSandbox when a higher-index plugin rejects it",
+			"should fail RunPodSandbox without leaking and notify both plugins "+
+				"when a higher-index plugin rejects it",
 			func(ctx SpecContext) {
 				By("starting an accepting plugin at index 00 and a rejecting plugin at index 10")
 
@@ -100,8 +121,15 @@ var _ = framework.KubeDescribe("NRI", func() {
 				)
 				accepting, rejecting := stubs[0].Plugin, stubs[1].Plugin
 
+				var reject atomic.Bool
+				reject.Store(true)
+
 				rejecting.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
-					return errors.New("induced NRI RunPodSandbox rejection")
+					if reject.Load() {
+						return errors.New("induced NRI RunPodSandbox rejection")
+					}
+
+					return nil
 				}
 
 				By("attempting RunPodSandbox")
@@ -112,82 +140,77 @@ var _ = framework.KubeDescribe("NRI", func() {
 					podConfig,
 					framework.TestContext.RuntimeHandler,
 				)
+				// Snapshot right when the call returns: the rollback teardown
+				// must already have been delivered.
+				acceptEvents, rejectEvents := accepting.Events(), rejecting.Events()
+
+				attemptedID := accepting.LastRunPodSandboxID()
+
+				registerPod(failedID)
+				registerPod(attemptedID)
+
 				Expect(runErr).To(HaveOccurred(),
 					"RunPodSandbox MUST fail when an NRI plugin rejects the RunPodSandbox event")
 				Expect(failedID).To(BeEmpty(),
 					"no pod sandbox ID should be returned when RunPodSandbox fails")
-
-				attemptedID := accepting.LastRunPodSandboxID()
 				Expect(attemptedID).NotTo(BeEmpty(),
 					"the accepting plugin should have received RunPodSandbox before the rejection")
-
-				podIDs = append(podIDs, attemptedID)
 
 				By("verifying both plugins saw the same sandbox in plugin index order")
 
 				Expect(rejecting.LastRunPodSandboxID()).To(Equal(attemptedID),
 					"the rejecting plugin should have received RunPodSandbox for the same sandbox")
 
-				acceptRun := rollbackFindEvent(
-					accepting.Events(), EventRunPodSandbox, attemptedID, "",
-				)
-				rejectRun := rollbackFindEvent(
-					rejecting.Events(), EventRunPodSandbox, attemptedID, "",
-				)
+				acceptRun := rollbackFindEvent(acceptEvents, EventRunPodSandbox, attemptedID, "")
+				rejectRun := rollbackFindEvent(rejectEvents, EventRunPodSandbox, attemptedID, "")
 
 				Expect(acceptRun).NotTo(BeNil())
 				Expect(rejectRun).NotTo(BeNil())
 
 				Expect(acceptRun.Timestamp).NotTo(BeTemporally(">", rejectRun.Timestamp),
-					"RunPodSandbox hooks MUST execute in plugin index order "+
-						"(index 00 before index 10)")
+					"RunPodSandbox hooks MUST execute in plugin index order (index 00 before "+
+						"index 10), per the unmerged draft containerd/nri#286 at revision 2339aa3")
 
-				By("verifying the failed sandbox is not left behind")
+				By("verifying the failed sandbox is not listed when the call returns")
 				expectRollbackPodNotListed(ctx, rc, attemptedID, podName)
 
-				By("checking whether the accepting plugin is told the sandbox was rolled back")
+				By("verifying both plugins got StopPodSandbox then RemovePodSandbox " +
+					"before the call returned")
+				expectRollbackPodTeardown(
+					acceptEvents,
+					"the accepting plugin at index 00",
+					attemptedID,
+				)
+				expectRollbackPodTeardown(
+					rejectEvents,
+					"the rejecting plugin at index 10",
+					attemptedID,
+				)
 
-				if !rollbackTeardownObserved(accepting, attemptedID, "", EventRemovePodSandbox) {
-					Skip(
-						"Expected: the plugin at index 00, which accepted RunPodSandbox for sandbox " +
-							attemptedID + ", receives StopPodSandbox and RemovePodSandbox for that sandbox " +
-							"after the plugin at index 10 rejected it, so the accepting plugin can release " +
-							"any state it allocated for the sandbox. " +
-							"Observed: no teardown event was delivered (events: " +
-							rollbackEventTypes(
-								accepting.Events(),
-								attemptedID,
-								"",
-							) + "). " +
-							"The NRI pod sandbox lifecycle spec (containerd/nri PR 286, " +
-							"docs/pod-sandbox-lifecycle.md) does not state what plugins are told when a " +
-							"later plugin fails RunPodSandbox, so runtimes are not required to do this yet. " +
-							"containerd (main, release/2.3) does: when nri.RunPodSandbox fails it relays " +
-							"StopPodSandbox and RemovePodSandbox for the sandbox to every plugin. " +
-							"See https://github.com/kubernetes-sigs/cri-tools/issues/2046.",
-					)
-				}
+				By("retrying RunPodSandbox with the same metadata")
 
-				teardown := rollbackTeardownEvents(accepting.Events(), attemptedID, "",
-					EventStopPodSandbox, EventRemovePodSandbox)
-				Expect(
-					teardown,
-				).To(Equal([]NRIEventType{EventStopPodSandbox, EventRemovePodSandbox}),
-					"rollback notifications MUST follow the RunPodSandbox -> StopPodSandbox -> "+
-						"RemovePodSandbox order, each delivered once")
+				reject.Store(false)
+				retryRollbackPod(ctx, rc, podConfig, registerPod)
 			},
 		)
 
 		It(
-			"should fail RunPodSandbox without leaking when the only plugin rejects it",
+			"should fail RunPodSandbox without leaking and notify the plugin when the only plugin rejects it",
 			func(ctx SpecContext) {
 				stubs = startRollbackStubs(
 					rollbackStubSpec{name: "cri-test-nri-rollback-self", idx: "00"},
 				)
 				plugin := stubs[0].Plugin
 
+				var reject atomic.Bool
+				reject.Store(true)
+
 				plugin.OnRunPodSandbox = func(_ context.Context, _ *nri.PodSandbox) error {
-					return errors.New("induced NRI RunPodSandbox rejection")
+					if reject.Load() {
+						return errors.New("induced NRI RunPodSandbox rejection")
+					}
+
+					return nil
 				}
 
 				By("attempting RunPodSandbox")
@@ -198,139 +221,180 @@ var _ = framework.KubeDescribe("NRI", func() {
 					podConfig,
 					framework.TestContext.RuntimeHandler,
 				)
+				events := plugin.Events()
+
+				attemptedID := plugin.LastRunPodSandboxID()
+
+				registerPod(failedID)
+				registerPod(attemptedID)
+
 				Expect(runErr).To(HaveOccurred(),
 					"RunPodSandbox MUST fail when the NRI RunPodSandbox hook returns an error")
 				Expect(failedID).To(BeEmpty(),
 					"no pod sandbox ID should be returned when RunPodSandbox fails")
-
-				attemptedID := plugin.LastRunPodSandboxID()
 				Expect(attemptedID).NotTo(BeEmpty(),
 					"the plugin should have received RunPodSandbox before rejecting it")
 
-				podIDs = append(podIDs, attemptedID)
-
-				By("verifying the failed sandbox is not left behind")
+				By("verifying the failed sandbox is not listed when the call returns")
 				expectRollbackPodNotListed(ctx, rc, attemptedID, podName)
 
 				By(
-					"recording whether the rejecting plugin receives teardown events for the sandbox",
+					"verifying the rejecting plugin got StopPodSandbox then RemovePodSandbox before the call returned",
 				)
+				expectRollbackPodTeardown(events, "the rejecting plugin", attemptedID)
 
-				notified := rollbackTeardownObserved(plugin, attemptedID, "", EventRemovePodSandbox)
-				teardown := rollbackTeardownEvents(plugin.Events(), attemptedID, "",
-					EventStopPodSandbox, EventRemovePodSandbox)
+				By("retrying RunPodSandbox with the same metadata")
 
-				if notified {
-					Expect(
-						teardown,
-					).To(Equal([]NRIEventType{EventStopPodSandbox, EventRemovePodSandbox}),
-						"if the runtime notifies the rejecting plugin, notifications MUST follow the "+
-							"RunPodSandbox -> StopPodSandbox -> RemovePodSandbox order, each delivered once")
-				}
-
-				Skip("The NRI pod sandbox lifecycle spec (containerd/nri PR 286, " +
-					"docs/pod-sandbox-lifecycle.md) only says plugins \"bear responsibility for errors " +
-					"they return\" from RunPodSandbox; it does not say whether the rejecting plugin " +
-					"receives StopPodSandbox/RemovePodSandbox for the rejected sandbox, so delivery is " +
-					"not asserted (only their order, if delivered). Sandbox failure and cleanup were " +
-					"verified. " +
-					"Observed teardown events for sandbox " + attemptedID + ": " +
-					fmt.Sprint(teardown) + ". " +
-					"containerd (main, release/2.3) relays StopPodSandbox and RemovePodSandbox to every " +
-					"plugin, including the rejecting one, when nri.RunPodSandbox fails. " +
-					"See https://github.com/kubernetes-sigs/cri-tools/issues/2046.")
+				reject.Store(false)
+				retryRollbackPod(ctx, rc, podConfig, registerPod)
 			},
 		)
 
 		It(
-			"should notify the plugin with StopContainer and RemoveContainer when it rejects CreateContainer",
+			"should fail CreateContainer without leaking and notify the plugin with RemoveContainer "+
+				"when it rejects CreateContainer",
 			func(ctx SpecContext) {
 				stubs = startRollbackStubs(
 					rollbackStubSpec{name: "cri-test-nri-rollback-ctr", idx: "00"},
 				)
 				plugin := stubs[0].Plugin
 
-				framework.PullPublicImage(
-					ctx,
-					ic,
-					framework.TestContext.TestImageList.DefaultTestContainerImage,
-					nil,
-				)
+				podID, podConfig := runRollbackContainerPod(ctx, rc, ic, "nri-test-rollback-ctr-")
+				registerPod(podID)
 
-				By("creating a pod sandbox")
-
-				podConfig, _ := newRollbackPodConfig(ctx, rc, "nri-test-rollback-ctr-")
-				podID := framework.RunPodSandbox(ctx, rc, podConfig)
-				podIDs = append(podIDs, podID)
+				var reject atomic.Bool
+				reject.Store(true)
 
 				plugin.OnCreateContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
-					return errors.New("induced NRI CreateContainer rejection")
+					if reject.Load() {
+						return errors.New("induced NRI CreateContainer rejection")
+					}
+
+					return nil
 				}
 
 				By("attempting CreateContainer")
 
-				containerName := "nri-test-rollback-ctr-" + framework.NewUUID()
-				containerConfig := &runtimeapi.ContainerConfig{
-					Metadata: framework.BuildContainerMetadata(
-						containerName,
-						framework.DefaultAttempt,
-					),
-					Image: &runtimeapi.ImageSpec{
-						Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
-					},
-					Command: framework.DefaultPauseCommand,
-					Linux:   &runtimeapi.LinuxContainerConfig{},
-				}
-
+				containerConfig, containerName := newRollbackContainerConfig(
+					"nri-test-rollback-ctr-",
+				)
 				failedID, createErr := framework.CreateContainerWithError(
 					ctx, rc, ic, containerConfig, podID, podConfig,
 				)
+				events := plugin.Events()
+
 				Expect(createErr).To(HaveOccurred(),
 					"CreateContainer MUST fail when the NRI CreateContainer hook returns an error")
 				Expect(failedID).To(BeEmpty(),
 					"no container ID should be returned when CreateContainer fails")
 
-				createEvent := rollbackLastEvent(plugin.Events(), EventCreateContainer)
+				createEvent := rollbackLastEvent(events, EventCreateContainer)
 				Expect(createEvent).NotTo(BeNil(),
 					"the plugin should have received CreateContainer before rejecting it")
 
 				attemptedID := createEvent.ContainerID
 				Expect(attemptedID).NotTo(BeEmpty())
 
-				By("verifying the failed container is not left behind")
+				By("verifying the failed container is not listed when the call returns")
+				expectRollbackContainerNotListed(ctx, rc, podID, attemptedID, containerName)
 
-				containers, err := rc.ListContainers(
-					ctx,
-					&runtimeapi.ContainerFilter{PodSandboxId: podID},
+				By("verifying the plugin got RemoveContainer before the call returned")
+				expectRollbackContainerTeardown(events, "the rejecting plugin", podID, attemptedID)
+
+				By("retrying CreateContainer with the same metadata")
+
+				reject.Store(false)
+				retryRollbackContainer(ctx, rc, ic, containerConfig, podID, podConfig)
+			},
+		)
+
+		It(
+			"should fail CreateContainer without leaking and notify both plugins "+
+				"when a higher-index plugin rejects it",
+			func(ctx SpecContext) {
+				By("starting an accepting plugin at index 00 and a rejecting plugin at index 10")
+
+				stubs = startRollbackStubs(
+					rollbackStubSpec{name: "cri-test-nri-rollback-ctr-accept", idx: "00"},
+					rollbackStubSpec{name: "cri-test-nri-rollback-ctr-reject", idx: "10"},
 				)
-				Expect(err).NotTo(HaveOccurred())
+				accepting, rejecting := stubs[0].Plugin, stubs[1].Plugin
 
-				for _, c := range containers {
-					matches := c.GetId() == attemptedID ||
-						(c.GetMetadata() != nil && c.GetMetadata().GetName() == containerName)
-					Expect(matches).To(BeFalse(),
-						"container %s MUST be cleaned up after a failed CreateContainer", c.GetId())
+				podID, podConfig := runRollbackContainerPod(
+					ctx,
+					rc,
+					ic,
+					"nri-test-rollback-ctr-multi-",
+				)
+				registerPod(podID)
+
+				var reject atomic.Bool
+				reject.Store(true)
+
+				rejecting.OnCreateContainer = func(_ context.Context, _ *nri.PodSandbox, _ *nri.Container) error {
+					if reject.Load() {
+						return errors.New("induced NRI CreateContainer rejection")
+					}
+
+					return nil
 				}
 
-				By("checking whether the plugin is told the container was rolled back")
+				By("attempting CreateContainer")
 
-				if !rollbackTeardownObserved(plugin, podID, attemptedID, EventRemoveContainer) {
-					Skip("Expected: after the plugin rejects CreateContainer for container " +
-						attemptedID + ", the runtime delivers StopContainer and RemoveContainer for " +
-						"that container so plugin state stays consistent with the runtime. " +
-						"Observed: no teardown event was delivered (events: " +
-						rollbackEventTypes(plugin.Events(), podID, attemptedID) + "). " +
-						"No NRI spec states this for CreateContainer failures, so runtimes are not " +
-						"required to do it. containerd (main, release/2.3) does: it calls " +
-						"UndoCreateContainer, which relays StopContainer and RemoveContainer to all " +
-						"plugins. See https://github.com/kubernetes-sigs/cri-tools/issues/2046.")
-				}
+				containerConfig, containerName := newRollbackContainerConfig(
+					"nri-test-rollback-ctr-multi-",
+				)
+				failedID, createErr := framework.CreateContainerWithError(
+					ctx, rc, ic, containerConfig, podID, podConfig,
+				)
+				acceptEvents, rejectEvents := accepting.Events(), rejecting.Events()
 
-				teardown := rollbackTeardownEvents(plugin.Events(), podID, attemptedID,
-					EventStopContainer, EventRemoveContainer)
-				Expect(teardown).To(Equal([]NRIEventType{EventStopContainer, EventRemoveContainer}),
-					"rollback notifications MUST follow the CreateContainer -> StopContainer -> "+
-						"RemoveContainer order, each delivered once")
+				Expect(createErr).To(HaveOccurred(),
+					"CreateContainer MUST fail when an NRI plugin rejects the CreateContainer event")
+				Expect(failedID).To(BeEmpty(),
+					"no container ID should be returned when CreateContainer fails")
+
+				acceptCreate := rollbackLastEvent(acceptEvents, EventCreateContainer)
+				Expect(acceptCreate).NotTo(BeNil(),
+					"the accepting plugin should have received CreateContainer before the rejection")
+
+				attemptedID := acceptCreate.ContainerID
+				Expect(attemptedID).NotTo(BeEmpty())
+
+				By("verifying both plugins saw the same container in plugin index order")
+
+				rejectCreate := rollbackFindEvent(
+					rejectEvents,
+					EventCreateContainer,
+					podID,
+					attemptedID,
+				)
+				Expect(rejectCreate).NotTo(BeNil(),
+					"the rejecting plugin should have received CreateContainer for the same container")
+				Expect(acceptCreate.Timestamp).NotTo(BeTemporally(">", rejectCreate.Timestamp),
+					"CreateContainer hooks MUST execute in plugin index order (index 00 before index 10)")
+
+				By("verifying the failed container is not listed when the call returns")
+				expectRollbackContainerNotListed(ctx, rc, podID, attemptedID, containerName)
+
+				By("verifying both plugins got RemoveContainer before the call returned")
+				expectRollbackContainerTeardown(
+					acceptEvents,
+					"the accepting plugin at index 00",
+					podID,
+					attemptedID,
+				)
+				expectRollbackContainerTeardown(
+					rejectEvents,
+					"the rejecting plugin at index 10",
+					podID,
+					attemptedID,
+				)
+
+				By("retrying CreateContainer with the same metadata")
+
+				reject.Store(false)
+				retryRollbackContainer(ctx, rc, ic, containerConfig, podID, podConfig)
 			},
 		)
 	})
@@ -383,6 +447,43 @@ func newRollbackPodConfig(
 	}, name
 }
 
+// runRollbackContainerPod pulls the test image and runs a pod sandbox for a
+// CreateContainer rollback spec.
+func runRollbackContainerPod(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	ic internalapi.ImageManagerService,
+	prefix string,
+) (podID string, podConfig *runtimeapi.PodSandboxConfig) {
+	framework.PullPublicImage(
+		ctx,
+		ic,
+		framework.TestContext.TestImageList.DefaultTestContainerImage,
+		nil,
+	)
+
+	By("creating a pod sandbox")
+
+	podConfig, _ = newRollbackPodConfig(ctx, rc, prefix)
+
+	return framework.RunPodSandbox(ctx, rc, podConfig), podConfig
+}
+
+// newRollbackContainerConfig builds a uniquely named container config and
+// returns it together with the container name.
+func newRollbackContainerConfig(prefix string) (config *runtimeapi.ContainerConfig, name string) {
+	name = prefix + framework.NewUUID()
+
+	return &runtimeapi.ContainerConfig{
+		Metadata: framework.BuildContainerMetadata(name, framework.DefaultAttempt),
+		Image: &runtimeapi.ImageSpec{
+			Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
+		},
+		Command: framework.DefaultPauseCommand,
+		Linux:   &runtimeapi.LinuxContainerConfig{},
+	}, name
+}
+
 // expectRollbackPodNotListed asserts that no sandbox with the given ID or name
 // is listed by the runtime.
 func expectRollbackPodNotListed(
@@ -397,8 +498,154 @@ func expectRollbackPodNotListed(
 		matches := pod.GetId() == podID ||
 			(pod.GetMetadata() != nil && pod.GetMetadata().GetName() == podName)
 		Expect(matches).To(BeFalse(),
-			"sandbox %s MUST be cleaned up after a failed RunPodSandbox", pod.GetId())
+			"sandbox %s MUST be cleaned up by the time a failed RunPodSandbox returns", pod.GetId())
 	}
+}
+
+// expectRollbackContainerNotListed asserts that no container with the given
+// ID or name is listed in the sandbox.
+func expectRollbackContainerNotListed(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	podID, containerID, containerName string,
+) {
+	containers, err := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{PodSandboxId: podID})
+	Expect(err).NotTo(HaveOccurred())
+
+	for _, c := range containers {
+		matches := c.GetId() == containerID ||
+			(c.GetMetadata() != nil && c.GetMetadata().GetName() == containerName)
+		Expect(matches).To(BeFalse(),
+			"container %s MUST be cleaned up by the time a failed CreateContainer returns", c.GetId())
+	}
+}
+
+// retryRollbackPod runs a sandbox with the config of a rolled-back attempt,
+// registers it for cleanup, and stops and removes it.
+func retryRollbackPod(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	podConfig *runtimeapi.PodSandboxConfig,
+	register func(string),
+) {
+	retryID, err := rc.RunPodSandbox(ctx, podConfig, framework.TestContext.RuntimeHandler)
+	register(retryID)
+	Expect(err).NotTo(HaveOccurred(),
+		"RunPodSandbox retried with the same metadata MUST succeed: "+rollbackRetryRationale)
+
+	Expect(rc.StopPodSandbox(ctx, retryID)).To(Succeed(),
+		"the retried sandbox %s MUST stop", retryID)
+	Expect(rc.RemovePodSandbox(ctx, retryID)).To(Succeed(),
+		"the retried sandbox %s MUST be removable", retryID)
+}
+
+// retryRollbackContainer creates a container with the config of a rolled-back
+// attempt and removes it.
+func retryRollbackContainer(
+	ctx context.Context,
+	rc internalapi.RuntimeService,
+	ic internalapi.ImageManagerService,
+	containerConfig *runtimeapi.ContainerConfig,
+	podID string,
+	podConfig *runtimeapi.PodSandboxConfig,
+) {
+	retryID, err := framework.CreateContainerWithError(
+		ctx,
+		rc,
+		ic,
+		containerConfig,
+		podID,
+		podConfig,
+	)
+	Expect(err).NotTo(HaveOccurred(),
+		"CreateContainer retried with the same metadata MUST succeed: "+rollbackRetryRationale)
+
+	Expect(rc.RemoveContainer(ctx, retryID)).To(Succeed(),
+		"the retried container %s MUST be removable", retryID)
+}
+
+// expectRollbackPodTeardown asserts that the events, snapshotted when the
+// failed RunPodSandbox returned, hold RunPodSandbox, then StopPodSandbox, then
+// RemovePodSandbox for the sandbox.
+func expectRollbackPodTeardown(events []NRIEvent, who, podID string) {
+	expectRollbackTeardown(events, who, podID, "",
+		EventRunPodSandbox, EventStopPodSandbox, EventRemovePodSandbox, true)
+}
+
+// expectRollbackContainerTeardown asserts that the events, snapshotted when the
+// failed CreateContainer returned, hold CreateContainer, then RemoveContainer
+// for the container, with StopContainer allowed in between.
+func expectRollbackContainerTeardown(events []NRIEvent, who, podID, containerID string) {
+	expectRollbackTeardown(events, who, podID, containerID,
+		EventCreateContainer, EventStopContainer, EventRemoveContainer, false)
+}
+
+// expectRollbackTeardown asserts the rollback of one object as seen by one
+// plugin: the create event comes first, every teardown event for the object
+// comes after it, stop arrives at least once when stopRequired, and remove
+// arrives at least once after any stop. Repeated teardown events are allowed.
+func expectRollbackTeardown(
+	events []NRIEvent,
+	who, podID, containerID string,
+	create, stop, remove NRIEventType,
+	stopRequired bool,
+) {
+	observed := rollbackEventTypes(events, podID, containerID)
+	createIdx, firstStop, lastRemove := -1, -1, -1
+
+	for i := range events {
+		e := &events[i]
+		if !rollbackMatches(e, podID, containerID) {
+			continue
+		}
+
+		if e.Type == create {
+			if createIdx < 0 {
+				createIdx = i
+			}
+
+			continue
+		}
+
+		if e.Type != stop && e.Type != remove {
+			continue
+		}
+
+		Expect(createIdx).To(BeNumerically(">=", 0),
+			"%s received %s before %s (events: %s); teardown MUST follow the create event",
+			who, e.Type, create, observed)
+
+		if e.Type == stop && firstStop < 0 {
+			firstStop = i
+		}
+
+		if e.Type == remove {
+			lastRemove = i
+		}
+	}
+
+	Expect(createIdx).To(BeNumerically(">=", 0),
+		"%s should have received %s (events: %s)", who, create, observed)
+
+	if stopRequired {
+		Expect(firstStop).To(BeNumerically(">=", 0),
+			"%s MUST receive %s for the rolled-back object before the failed call returns "+
+				"(events: %s): %s", who, stop, observed, rollbackRationale)
+	}
+
+	Expect(lastRemove).To(BeNumerically(">", max(createIdx, firstStop)),
+		"%s MUST receive %s after %s%s for the rolled-back object before the failed call returns "+
+			"(events: %s): %s", who, remove, create, rollbackStopNote(stop, firstStop), observed,
+		rollbackRationale)
+}
+
+// rollbackStopNote names the stop event in a failure message when it was seen.
+func rollbackStopNote(stop NRIEventType, firstStop int) string {
+	if firstStop < 0 {
+		return ""
+	}
+
+	return " and " + string(stop)
 }
 
 // rollbackMatches reports whether the event targets the given sandbox and,
@@ -434,38 +681,8 @@ func rollbackLastEvent(events []NRIEvent, t NRIEventType) *NRIEvent {
 	return nil
 }
 
-// rollbackTeardownEvents returns, in delivery order, the events of the given
-// types the plugin received for the sandbox (and container, if non-empty).
-func rollbackTeardownEvents(
-	events []NRIEvent,
-	podID, containerID string,
-	types ...NRIEventType,
-) []NRIEventType {
-	var result []NRIEventType
-
-	for i := range events {
-		if slices.Contains(types, events[i].Type) &&
-			rollbackMatches(&events[i], podID, containerID) {
-			result = append(result, events[i].Type)
-		}
-	}
-
-	return result
-}
-
-// rollbackTeardownObserved waits for the plugin to receive an event of the
-// given type for the sandbox (and container, if non-empty). It does not fail
-// the spec on timeout, so a missing notification can be reported via Skip.
-func rollbackTeardownObserved(p *NRITestPlugin, podID, containerID string, want NRIEventType) bool {
-	g := NewGomega(func(string, ...int) {})
-
-	return g.Eventually(func() []NRIEventType {
-		return rollbackTeardownEvents(p.Events(), podID, containerID, want)
-	}).WithTimeout(rollbackObserveTimeout).WithPolling(rollbackObservePoll).Should(ContainElement(want))
-}
-
 // rollbackEventTypes renders all event types recorded for the sandbox (and
-// container, if non-empty), for use in Skip notes.
+// container, if non-empty), for use in failure messages.
 func rollbackEventTypes(events []NRIEvent, podID, containerID string) string {
 	var types []NRIEventType
 
