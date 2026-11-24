@@ -120,6 +120,11 @@ type TestContextType struct {
 
 	// NRI (Node Resource Interface) settings.
 	NRISocketPath string
+
+	// NRIValidatorRejectsSeccomp is set by the operator when the runtime's NRI
+	// default validator is configured to reject adjustments of the seccomp
+	// policy of RuntimeDefault containers.
+	NRIValidatorRejectsSeccomp bool
 }
 
 // TestContext is a test context.
@@ -270,6 +275,14 @@ func RegisterFlags() {
 		"nri-socket",
 		"",
 		"Path to the NRI socket. NRI tests are skipped when not set.",
+	)
+	flag.BoolVar(
+		&TestContext.NRIValidatorRejectsSeccomp,
+		"nri-validator-rejects-seccomp",
+		false,
+		"Set when the runtime's NRI default validator rejects seccomp adjustments of "+
+			"RuntimeDefault containers (containerd: reject_runtime_default_seccomp_adjustment). "+
+			"The NRI seccomp adjustment test is skipped when not set.",
 	)
 }
 

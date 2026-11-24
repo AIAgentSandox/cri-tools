@@ -236,13 +236,22 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(strings.Fields(mountLine)[2]).To(Equal("tmpfs"),
 					"mount %s injected by NRI should be a tmpfs", adjustMountPath)
 
+				By("verifying the injected mount carries the requested options")
+				// The kernel reports the tmpfs size in KiB: size=1m reads back as size=1024k.
+				Expect(strings.Fields(mountLine)).To(HaveLen(6),
+					"unexpected /proc/self/mounts line %q", mountLine)
+				Expect(strings.Split(strings.Fields(mountLine)[3], ",")).To(
+					ContainElements("nosuid", "nodev", "size=1024k"),
+					"mount %s injected by NRI should carry the options nosuid, nodev and size=1m: %q",
+					adjustMountPath, mountLine)
+
 				By("verifying the injected mount is writable")
 				adjustExec(ctx, rc, containerID, "touch", adjustMountPath+"/probe")
 			},
 		)
 
 		It(
-			"should expose an annotation adjustment through ContainerStatus",
+			"should expose an annotation adjustment in the OCI runtime spec of verbose ContainerStatus",
 			func(ctx SpecContext) {
 				testStub.Plugin.OnCreateContainer = func(
 					_ context.Context,
@@ -255,32 +264,18 @@ var _ = framework.KubeDescribe("NRI", func() {
 					return adj, nil
 				}
 
-				config := newContainerConfig("nri-test-adjust-annotation-")
-				config.Annotations = map[string]string{"cri-tools.test/original": "true"}
-
 				By("creating a container adjusted by the NRI plugin")
-				createAndStart(ctx, config)
+				createAndStart(ctx, newContainerConfig("nri-test-adjust-annotation-"))
 
-				By("checking annotations reported by ContainerStatus")
-
+				By("reading the OCI runtime spec from verbose ContainerStatus info")
+				// NRI adjusts the OCI spec, not the CRI ContainerConfig. The CRI API
+				// requires ContainerStatus.Annotations to equal the annotations of the
+				// ContainerConfig, so the adjustment is only observable in the OCI
+				// runtime spec that runtimes such as containerd and CRI-O report under
+				// the "info" key of the verbose status.
 				resp, err := rc.ContainerStatus(ctx, containerID, true)
 				Expect(err).NotTo(HaveOccurred())
 
-				annotations := resp.GetStatus().GetAnnotations()
-				Expect(annotations).To(HaveKeyWithValue("cri-tools.test/original", "true"),
-					"annotations from ContainerConfig must be reported by ContainerStatus")
-
-				if value, ok := annotations[adjustAnnotationKey]; ok {
-					Expect(value).To(Equal(adjustAnnotationVal))
-
-					return
-				}
-
-				By("falling back to the runtime spec reported in verbose ContainerStatus info")
-				// ContainerStatus.Annotations carries the annotations of the CRI
-				// ContainerConfig, while NRI adjusts the OCI spec. Runtimes such as
-				// containerd and CRI-O report that spec under the "info" key of the
-				// verbose status, which keeps the adjustment observable through CRI.
 				var info struct {
 					RuntimeSpec *struct {
 						Annotations map[string]string `json:"annotations"`
@@ -289,18 +284,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				rawInfo, ok := resp.GetInfo()["info"]
 				if !ok || json.Unmarshal([]byte(rawInfo), &info) != nil || info.RuntimeSpec == nil {
-					Skip(fmt.Sprintf(
-						"Expected annotation %q added by an NRI CreateContainer adjustment to be "+
-							"observable through ContainerStatus. It is not in the status annotations "+
-							"(%v), which report the CRI ContainerConfig annotations, and the verbose "+
-							"status info does not expose the OCI runtime spec, so the adjustment is "+
-							"not CRI-observable on this runtime.",
-						adjustAnnotationKey, annotations))
+					Skip("The runtime does not report the OCI runtime spec as " +
+						`info["info"].runtimeSpec in verbose ContainerStatus, so an annotation ` +
+						"added by an NRI CreateContainer adjustment cannot be observed through CRI.")
 				}
 
 				Expect(info.RuntimeSpec.Annotations).To(
 					HaveKeyWithValue(adjustAnnotationKey, adjustAnnotationVal),
-					"OCI runtime spec reported by verbose ContainerStatus should carry the "+
+					"OCI runtime spec reported by verbose ContainerStatus must carry the "+
 						"annotation added by the NRI adjustment")
 			},
 		)
@@ -358,6 +349,17 @@ var _ = framework.KubeDescribe("NRI", func() {
 					},
 				}
 
+				// Whether the validator rejects this adjustment is runtime
+				// configuration that CRI does not report, so the operator states it
+				// with a flag. It is never inferred from the outcome under test.
+				if !framework.TestContext.NRIValidatorRejectsSeccomp {
+					Skip("The NRI default validator is not known to reject seccomp adjustments " +
+						"of RuntimeDefault containers on this runtime. Enable it in the runtime " +
+						"(containerd: reject_runtime_default_seccomp_adjustment, see " +
+						"https://github.com/containerd/nri#default-validation) and pass " +
+						"--nri-validator-rejects-seccomp to run this test.")
+				}
+
 				By(
 					"creating a RuntimeDefault seccomp container whose policy the NRI plugin overrides",
 				)
@@ -365,25 +367,23 @@ var _ = framework.KubeDescribe("NRI", func() {
 				createdID, err := framework.CreateContainerWithError(
 					ctx, rc, ic, config, podID, podConfig)
 				if err == nil {
-					containerID = createdID
+					containerID = createdID // hand to AfterEach for cleanup
 
-					Skip(
-						"The runtime accepted an NRI adjustment that replaces the RuntimeDefault " +
-							"seccomp policy requested by the container security context. Rejecting it " +
-							"requires the NRI default validator with " +
-							"reject_runtime_default_seccomp_adjustment enabled in the runtime config " +
-							"(see https://github.com/containerd/nri#default-validation), which this " +
-							"test environment does not appear to enable.",
-					)
+					Fail("CreateContainer succeeded although the NRI default validator is " +
+						"configured to reject an adjustment that replaces the RuntimeDefault " +
+						"seccomp policy requested by the container security context")
 				}
 
 				framework.Logf("CreateContainer rejected the seccomp adjustment: %v", err)
+				// The NRI API formats a validator rejection as
+				// `validator "<name>" rejected container adjustment, reason: ...`. Any
+				// other error is a plugin or runtime failure, not the validator's.
+				Expect(err.Error()).To(ContainSubstring("rejected container adjustment"),
+					"CreateContainer must fail because the NRI validator rejected the adjustment")
 				Expect(createdID).To(BeEmpty(),
 					"no container ID should be returned when the adjustment is rejected")
-				Expect(adjustedContainerIDs(testStub.Plugin)).NotTo(BeEmpty(),
-					"NRI CreateContainer hook should have been invoked before the rejection")
 
-				By("verifying the rejected container was not leaked")
+				By("verifying the rejected container is not listed when CreateContainer returns")
 
 				containers, err := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
 					PodSandboxId: podID,
@@ -394,9 +394,45 @@ var _ = framework.KubeDescribe("NRI", func() {
 					if c.GetMetadata().GetName() == config.GetMetadata().GetName() {
 						containerID = c.GetId() // hand to AfterEach for cleanup
 						Fail(fmt.Sprintf(
-							"container %s was leaked after the adjustment was rejected", c.GetId()))
+							"container %s is still listed after the adjustment was rejected",
+							c.GetId(),
+						))
 					}
 				}
+
+				By("verifying the plugin was told to remove the rejected container")
+				// A plugin that allocated on CreateContainer must be told when the
+				// container is rolled back, or it leaks: it gets RemoveContainer
+				// before the CRI call returns, after its CreateContainer.
+				events := testStub.Plugin.Events()
+				createIdx, removeIdx := -1, -1
+
+				for i, e := range events {
+					if e.ContainerName != config.GetMetadata().GetName() {
+						continue
+					}
+
+					switch {
+					case e.Type == EventCreateContainer && createIdx < 0:
+						createIdx = i
+					case e.Type == EventRemoveContainer && createIdx >= 0 &&
+						e.ContainerID == events[createIdx].ContainerID && removeIdx < 0:
+						removeIdx = i
+					}
+				}
+
+				Expect(createIdx).To(BeNumerically(">=", 0),
+					"NRI CreateContainer hook should have been invoked before the rejection")
+				Expect(removeIdx).To(BeNumerically(">", createIdx),
+					"plugin must receive RemoveContainer for the rejected container %s "+
+						"after its CreateContainer, before CreateContainer returns; events: %+v",
+					events[createIdx].ContainerID, events)
+
+				By("retrying the create with the same metadata and no adjustment")
+				// The rejected create must leave nothing behind that blocks the name.
+				testStub.Plugin.OnCreateContainer = nil
+				containerID = framework.CreateContainer(ctx, rc, ic, config, podID, podConfig)
+				Expect(containerID).NotTo(BeEmpty())
 			},
 		)
 	})
