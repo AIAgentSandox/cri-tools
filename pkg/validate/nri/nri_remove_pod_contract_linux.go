@@ -20,6 +20,7 @@ import (
 	"context"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nri "github.com/containerd/nri/pkg/api"
@@ -153,24 +154,50 @@ var _ = framework.KubeDescribe("NRI", func() {
 		It(
 			"should stop and remove workload containers and stop the sandbox before the RemovePodSandbox hook fires",
 			func(ctx SpecContext) {
-				// This test validates the spec contract for RemovePodSandbox called on a
-				// running sandbox without a prior StopPodSandbox: the runtime MUST stop
-				// and remove all workload containers and complete StopPodSandbox before
-				// the RemovePodSandbox NRI event fires (RunPodSandbox → StopPodSandbox →
-				// RemovePodSandbox ordering).
+				// RemovePodSandbox called on a running sandbox without a prior
+				// StopPodSandbox. The CRI API requires that running containers
+				// "must be forcibly terminated and removed". The pod sandbox
+				// lifecycle draft in containerd/nri#286 (unmerged, reviewed at
+				// revision 2339aa3) places the RemovePodSandbox event after the
+				// sandbox is stopped and "just prior to removing the pod from the
+				// pod list". So the runtime first does everything StopPodSandbox
+				// would do (including its hooks), then removes the containers, and
+				// only then delivers RemovePodSandbox: while that hook runs, the
+				// pod's containers are gone and the sandbox is still listed as
+				// NotReady. A plugin that frees per-pod state on RemovePodSandbox
+				// must not see containers of the pod or events for it afterwards.
+				//
+				// Plugin errors from the RemovePodSandbox hook (the CRI call
+				// reporting them, redelivery on retry and withholding removal) are
+				// covered by the NRI teardown error-handling tests, not here.
 				hookReached := make(chan struct{})
 
-				var hookOnce sync.Once
+				var (
+					hookOnce        sync.Once
+					hookTargetPodID atomic.Value
+					hookTimedOut    atomic.Bool
+				)
+
+				hookTargetPodID.Store("")
 
 				var err error
 
 				testStub, err = StartNRITestStub("cri-test-nri-remove-state", "00")
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
-				// Block the RemovePodSandbox hook so the main goroutine can inspect
-				// runtime state while it is in progress. sync.Once guards against
-				// double close of hookReached on a duplicate invocation.
-				testStub.Plugin.OnRemovePodSandbox = func(hookCtx context.Context, _ *nri.PodSandbox) error {
+				// Block the RemovePodSandbox hook for the pod under test only, so
+				// the main goroutine can inspect runtime state while it is in
+				// progress. sync.Once guards against double close of hookReached
+				// on a duplicate invocation. hookTimedOut records whether the
+				// runtime's plugin request timeout ended the hook before it was
+				// released, which would make the in-hook checks read post-hook
+				// state.
+				testStub.Plugin.OnRemovePodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
+					target, _ := hookTargetPodID.Load().(string)
+					if target == "" || pod.GetId() != target {
+						return nil
+					}
+
 					firstInvocation := false
 
 					hookOnce.Do(func() { firstInvocation = true })
@@ -184,6 +211,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 					select {
 					case <-hookBlocking:
 					case <-hookCtx.Done():
+						hookTimedOut.Store(true)
 					}
 
 					return nil
@@ -194,6 +222,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 				var podConfig *runtimeapi.PodSandboxConfig
 
 				podID, podConfig = removePodContractRunPodSandbox(ctx, rc, "nri-test-remove-state-")
+				hookTargetPodID.Store(podID)
 
 				By("creating and starting a container in the sandbox")
 				framework.PullPublicImage(
@@ -227,57 +256,75 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("triggering RemovePodSandbox without a prior StopPodSandbox in a goroutine")
 
-				var (
-					removeErr error
-					removeWg  sync.WaitGroup
-				)
+				var removeErr error
 
-				removeWg.Go(func() {
+				removeDone := make(chan struct{})
+
+				go func() {
+					defer GinkgoRecover()
+					defer close(removeDone)
+
 					removeErr = rc.RemovePodSandbox(ctx, podID)
-				})
+				}()
 
 				By("waiting for RemovePodSandbox hook to be reached")
 
 				select {
 				case <-hookReached:
 					// Hook is now blocking; main goroutine can inspect state.
+				case <-removeDone:
+					Fail(
+						"RemovePodSandbox returned without delivering the RemovePodSandbox NRI hook " +
+							"for the pod under test",
+					)
 				case <-time.After(30 * time.Second):
 					unblockOnce.Do(func() { close(hookBlocking) })
-					removeWg.Wait()
+					<-removeDone
 					Fail("Timed out waiting for RemovePodSandbox NRI hook to fire")
 				}
 
-				By("verifying all workload containers were removed before the hook fired")
+				By("observing runtime state while the hook is blocked")
 
+				// Gather the observations first and keep this fast: the runtime's
+				// plugin request timeout (about 2s by default in containerd) ends
+				// the hook, after which these calls would read post-hook state.
 				containers, listErr := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
 					PodSandboxId: podID,
 				})
-				Expect(listErr).NotTo(HaveOccurred(), "ListContainers during RemovePodSandbox hook")
-				Expect(containers).To(BeEmpty(),
-					"all workload containers MUST be removed before RemovePodSandbox hook fires")
-
-				By("verifying the sandbox is stopped (NOT_READY) while the hook is in progress")
-
 				sandboxes, listPodErr := rc.ListPodSandbox(
 					ctx,
 					&runtimeapi.PodSandboxFilter{Id: podID},
 				)
+
+				removeReturnedDuringHook := false
+
+				select {
+				case <-removeDone:
+					removeReturnedDuringHook = true
+				default:
+				}
+
+				Expect(hookTimedOut.Load()).To(BeFalse(),
+					"invalid test run: the RemovePodSandbox hook context expired before the hook was "+
+						"released, so the in-hook checks may have observed post-hook state")
+
+				By("verifying RemovePodSandbox had not returned while the hook was blocked")
+				Expect(removeReturnedDuringHook).To(BeFalse(),
+					"RemovePodSandbox MUST NOT return while the RemovePodSandbox NRI hook is in progress")
+
+				By("verifying all workload containers were removed before the hook fired")
+				Expect(listErr).NotTo(HaveOccurred(), "ListContainers during RemovePodSandbox hook")
+				Expect(containers).To(BeEmpty(),
+					"all workload containers MUST be removed before RemovePodSandbox hook fires")
+
+				By(
+					"verifying the sandbox is still listed and stopped (NOT_READY) while the hook is in progress",
+				)
 				Expect(
 					listPodErr,
 				).NotTo(HaveOccurred(), "ListPodSandbox during RemovePodSandbox hook")
-
-				if len(sandboxes) == 0 {
-					// SPEC_DISCREPANCY: the spec says the RemovePodSandbox event fires
-					// "just prior to removing the pod from the pod list", so the sandbox
-					// should still be listed while the hook is in progress.
-					Skip(
-						"spec discrepancy: sandbox is no longer listed by ListPodSandbox while the " +
-							"RemovePodSandbox NRI hook is in progress; spec says the event fires just " +
-							"prior to removing the pod from the pod list",
-					)
-				}
-
-				Expect(sandboxes).To(HaveLen(1))
+				Expect(sandboxes).To(HaveLen(1),
+					"sandbox MUST still be listed while the RemovePodSandbox NRI hook is in progress")
 				Expect(
 					sandboxes[0].GetState(),
 				).To(Equal(runtimeapi.PodSandboxState_SANDBOX_NOTREADY),
@@ -285,13 +332,24 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				By("releasing the hook and verifying RemovePodSandbox succeeds")
 				unblockOnce.Do(func() { close(hookBlocking) })
-				removeWg.Wait()
+				<-removeDone
 				Expect(
 					removeErr,
 				).NotTo(HaveOccurred(), "RemovePodSandbox should succeed after hook returns")
 
-				// RemovePodSandbox removed both; clear so AfterEach skips them.
 				removedPodID, removedContainerID := podID, containerID
+
+				By("verifying the sandbox is no longer listed")
+
+				sandboxes, listPodErr = rc.ListPodSandbox(
+					ctx,
+					&runtimeapi.PodSandboxFilter{Id: removedPodID},
+				)
+				Expect(listPodErr).NotTo(HaveOccurred())
+				Expect(sandboxes).To(BeEmpty(),
+					"sandbox MUST NOT be listed by ListPodSandbox after RemovePodSandbox returns")
+
+				// RemovePodSandbox removed both; clear so AfterEach skips them.
 				podID, containerID = "", ""
 
 				By("verifying NRI event ordering for the pod")
@@ -325,21 +383,38 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				Expect(runIdx).To(BeNumerically("<", stopPodIdx),
 					"RunPodSandbox MUST precede StopPodSandbox")
+				Expect(stopCtrIdx).To(BeNumerically("<", removeCtrIdx),
+					"StopContainer MUST precede RemoveContainer for the workload container")
 				Expect(stopCtrIdx).To(BeNumerically("<", stopPodIdx),
 					"workload containers MUST be stopped before StopPodSandbox")
+				Expect(stopPodIdx).To(BeNumerically("<", removeCtrIdx),
+					"StopPodSandbox MUST precede RemoveContainer when RemovePodSandbox is called on a running sandbox")
 				Expect(stopPodIdx).To(BeNumerically("<", removePodIdx),
 					"StopPodSandbox MUST precede RemovePodSandbox")
 				Expect(removeCtrIdx).To(BeNumerically("<", removePodIdx),
 					"workload containers MUST be removed before RemovePodSandbox")
+
+				By("verifying the RemovePodSandbox NRI hook was delivered exactly once")
+				Expect(
+					removePodContractCountEvents(
+						testStub.Plugin,
+						removedPodID,
+						EventRemovePodSandbox,
+					),
+				).
+					To(Equal(1), "RemovePodSandbox NRI hook MUST be delivered exactly once")
 			},
 		)
 
 		It(
 			"should remove the sandbox from ListPodSandbox and handle a second RemovePodSandbox without another NRI event",
 			func(ctx SpecContext) {
-				// This test validates that after RemovePodSandbox returns the sandbox is
-				// no longer listed, and that RemovePodSandbox is idempotent: a second
-				// call succeeds and does not generate another RemovePodSandbox NRI event.
+				// After RemovePodSandbox returns the sandbox is no longer listed.
+				// The CRI API makes RemovePodSandbox idempotent: it "must not
+				// return an error if the sandbox has already been removed". A
+				// repeated call on a removed pod must not deliver any NRI event
+				// for it: plugins have already released that pod and would
+				// otherwise see teardown for an object that no longer exists.
 				var err error
 
 				testStub, err = StartNRITestStub("cri-test-nri-remove-idempotent", "00")
@@ -354,7 +429,6 @@ var _ = framework.KubeDescribe("NRI", func() {
 					"First RemovePodSandbox call should succeed")
 
 				removedPodID := podID
-				podID = ""
 
 				By("verifying the sandbox is no longer listed")
 
@@ -366,6 +440,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(sandboxes).To(BeEmpty(),
 					"sandbox MUST NOT be listed by ListPodSandbox after RemovePodSandbox returns")
 
+				// The sandbox is gone; clear so AfterEach skips it.
+				podID = ""
+
 				By("verifying the RemovePodSandbox NRI hook fired exactly once")
 				Eventually(func() int {
 					return removePodContractCountEvents(
@@ -376,19 +453,39 @@ var _ = framework.KubeDescribe("NRI", func() {
 				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
 					"RemovePodSandbox NRI hook should fire exactly once for the first call")
 
+				eventsAfterFirstRemove := len(
+					FilterEventsByPodID(testStub.Plugin.Events(), removedPodID),
+				)
+
 				By("calling RemovePodSandbox again (idempotency check)")
 				Expect(rc.RemovePodSandbox(ctx, removedPodID)).NotTo(HaveOccurred(),
 					"Second RemovePodSandbox call MUST succeed (idempotent)")
 
-				By("verifying the second RemovePodSandbox does NOT generate an NRI event")
+				By(
+					"verifying the second RemovePodSandbox does NOT deliver any NRI event for the pod",
+				)
 				Consistently(func() int {
+					return len(FilterEventsByPodID(testStub.Plugin.Events(), removedPodID))
+				}, 2*time.Second, 200*time.Millisecond).Should(Equal(eventsAfterFirstRemove),
+					"Second RemovePodSandbox MUST NOT deliver any NRI event for the already removed pod")
+
+				By("verifying the plugin still receives events (positive control)")
+
+				podID, _ = removePodContractRunPodSandbox(
+					ctx,
+					rc,
+					"nri-test-remove-idempotent-control-",
+				)
+				controlPodID := podID
+
+				Eventually(func() int {
 					return removePodContractCountEvents(
 						testStub.Plugin,
-						removedPodID,
-						EventRemovePodSandbox,
+						controlPodID,
+						EventRunPodSandbox,
 					)
-				}, 2*time.Second, 200*time.Millisecond).Should(Equal(1),
-					"Second RemovePodSandbox MUST NOT generate an NRI event — sandbox is already removed")
+				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
+					"the plugin MUST still receive events after the second RemovePodSandbox")
 			},
 		)
 	})
