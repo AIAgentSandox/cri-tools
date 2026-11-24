@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -47,9 +48,13 @@ const (
 
 // updateEvent records an UpdateContainer or PostUpdateContainer NRI event.
 type updateEvent struct {
-	Type         string
-	PodSandboxID string
-	ContainerID  string
+	Type          string
+	PodSandboxID  string
+	PodName       string
+	PodNamespace  string
+	PodUID        string
+	ContainerID   string
+	ContainerName string
 	// Resources holds the requested resources for UpdateContainer and the
 	// container's resources as reported by the runtime for PostUpdateContainer.
 	Resources *nri.LinuxResources
@@ -67,6 +72,9 @@ type updateTestPlugin struct {
 	// onUpdate, if set, is invoked from UpdateContainer and its result is
 	// returned to the runtime.
 	onUpdate func(container *nri.Container, req *nri.LinuxResources) ([]*nri.ContainerUpdate, error)
+
+	// postUpdateErr, if set, is returned from PostUpdateContainer.
+	postUpdateErr error
 }
 
 // Synchronize implements stub.SynchronizeInterface and signals readiness.
@@ -108,7 +116,10 @@ func (p *updateTestPlugin) PostUpdateContainer(
 ) error {
 	p.record(updateEventPostUpdate, pod, container, container.GetLinux().GetResources())
 
-	return nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.postUpdateErr
 }
 
 func (p *updateTestPlugin) setOnUpdate(
@@ -118,6 +129,13 @@ func (p *updateTestPlugin) setOnUpdate(
 	defer p.mu.Unlock()
 
 	p.onUpdate = hook
+}
+
+func (p *updateTestPlugin) setPostUpdateErr(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.postUpdateErr = err
 }
 
 func (p *updateTestPlugin) record(
@@ -135,10 +153,14 @@ func (p *updateTestPlugin) record(
 	}
 
 	p.events = append(p.events, updateEvent{
-		Type:         eventType,
-		PodSandboxID: pod.GetId(),
-		ContainerID:  container.GetId(),
-		Resources:    res,
+		Type:          eventType,
+		PodSandboxID:  pod.GetId(),
+		PodName:       pod.GetName(),
+		PodNamespace:  pod.GetNamespace(),
+		PodUID:        pod.GetUid(),
+		ContainerID:   container.GetId(),
+		ContainerName: container.GetName(),
+		Resources:     res,
 	})
 }
 
@@ -185,10 +207,33 @@ func startUpdateTestPlugin() (*updateTestPlugin, func(), error) {
 
 	plugin := &updateTestPlugin{ready: make(chan struct{})}
 
+	// Keep the connection so stop can force-close it. stub.Stop takes the
+	// stub's lock, which Start holds while waiting for the runtime and Run's
+	// own Stop holds while waiting for in-flight handlers, so calling it from
+	// here can block forever. Closing the connection unblocks both.
+	var (
+		connMu sync.Mutex
+		conn   net.Conn
+	)
+
+	dialer := func(path string) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(context.Background(), "unix", path)
+		if err != nil {
+			return nil, err
+		}
+
+		connMu.Lock()
+		conn = c
+		connMu.Unlock()
+
+		return c, nil
+	}
+
 	s, err := stub.New(plugin,
 		stub.WithPluginName("cri-test-nri-update"),
 		stub.WithPluginIdx("00"),
 		stub.WithSocketPath(socketPath),
+		stub.WithDialer(dialer),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create NRI stub: %w", err)
@@ -209,8 +254,22 @@ func startUpdateTestPlugin() (*updateTestPlugin, func(), error) {
 
 		select {
 		case <-done:
+			return
 		case <-time.After(5 * time.Second):
-			s.Stop()
+		}
+
+		connMu.Lock()
+		if conn != nil {
+			conn.Close()
+		}
+		connMu.Unlock()
+
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			framework.Logf(
+				"NRI update test stub still running 10s after stop; leaking its goroutine",
+			)
 		}
 	}
 
@@ -247,8 +306,44 @@ func statusLinuxResources(
 ) *runtimeapi.LinuxContainerResources {
 	resp, err := rc.ContainerStatus(ctx, containerID, false)
 	Expect(err).NotTo(HaveOccurred(), "ContainerStatus(%s)", containerID)
+	Expect(resp.GetStatus()).NotTo(BeNil(),
+		"ContainerStatus(%s) MUST return a status for an existing container", containerID)
 
 	return resp.GetStatus().GetResources().GetLinux()
+}
+
+// cpuWeight converts CPU shares to a cgroup v2 cpu.weight with the formula
+// runc and crun use. A runtime on cgroup v2 may report shares recovered from
+// the weight, which is lossy, so CPU shares are compared after this
+// normalization rather than as raw values.
+func cpuWeight(shares int64) int64 {
+	if shares == 0 {
+		return 0
+	}
+
+	return 1 + ((shares-2)*9999)/262142
+}
+
+// expectSameCPUShares asserts that two CPU share values are equal after
+// cgroup v2 weight normalization.
+func expectSameCPUShares(got, want int64, description string) {
+	GinkgoHelper()
+	Expect(cpuWeight(got)).To(Equal(cpuWeight(want)),
+		"%s: got %d shares (weight %d), want %d shares (weight %d)",
+		description, got, cpuWeight(got), want, cpuWeight(want))
+}
+
+// expectOnePostUpdate waits for a PostUpdateContainer event for the
+// container and then checks that no second one follows.
+func expectOnePostUpdate(plugin *updateTestPlugin, containerID string) {
+	GinkgoHelper()
+
+	count := func() int { return len(plugin.eventsFor(updateEventPostUpdate, containerID)) }
+
+	Eventually(count, 10*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1),
+		"PostUpdateContainer MUST be delivered")
+	Consistently(count, 2*time.Second, 200*time.Millisecond).Should(Equal(1),
+		"PostUpdateContainer MUST be delivered exactly once")
 }
 
 var _ = framework.KubeDescribe("NRI", func() {
@@ -273,7 +368,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 			plugin      *updateTestPlugin
 			stopPlugin  func()
 			podID       string
+			podMeta     *runtimeapi.PodSandboxMetadata
 			containerID string
+			ctrName     string
 		)
 
 		BeforeEach(func(ctx SpecContext) {
@@ -291,13 +388,14 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			By("creating a pod sandbox")
 
+			podMeta = framework.BuildPodSandboxMetadata(
+				"nri-test-update-"+framework.NewUUID(),
+				framework.DefaultUIDPrefix+framework.NewUUID(),
+				framework.DefaultNamespacePrefix+framework.NewUUID(),
+				framework.DefaultAttempt,
+			)
 			podConfig := &runtimeapi.PodSandboxConfig{
-				Metadata: framework.BuildPodSandboxMetadata(
-					"nri-test-update-"+framework.NewUUID(),
-					framework.DefaultUIDPrefix+framework.NewUUID(),
-					framework.DefaultNamespacePrefix+framework.NewUUID(),
-					framework.DefaultAttempt,
-				),
+				Metadata: podMeta,
 				Linux: &runtimeapi.LinuxPodSandboxConfig{
 					CgroupParent: common.GetCgroupParent(ctx, rc),
 				},
@@ -307,11 +405,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 			By("creating and starting a container with initial resources")
 
+			ctrName = "nri-test-update-ctr-" + framework.NewUUID()
 			containerConfig := &runtimeapi.ContainerConfig{
-				Metadata: framework.BuildContainerMetadata(
-					"nri-test-update-ctr-"+framework.NewUUID(),
-					framework.DefaultAttempt,
-				),
+				Metadata: framework.BuildContainerMetadata(ctrName, framework.DefaultAttempt),
 				Image: &runtimeapi.ImageSpec{
 					Image: framework.TestContext.TestImageList.DefaultTestContainerImage,
 				},
@@ -355,28 +451,56 @@ var _ = framework.KubeDescribe("NRI", func() {
 			}
 		})
 
-		It("should deliver UpdateContainer then PostUpdateContainer with the requested resources",
+		// expectIdentity checks that an event carries the pod and container
+		// identity and the metadata from the CRI requests. A plugin keys its
+		// per-container state on these, so a wrong one makes it update the
+		// wrong object.
+		expectIdentity := func(e updateEvent) {
+			GinkgoHelper()
+			Expect(e.PodSandboxID).To(Equal(podID), "%s MUST carry the pod sandbox ID", e.Type)
+			Expect(e.ContainerID).To(Equal(containerID), "%s MUST carry the container ID", e.Type)
+			Expect(e.PodName).To(Equal(podMeta.GetName()), "%s MUST carry the pod name", e.Type)
+			Expect(
+				e.PodNamespace,
+			).To(Equal(podMeta.GetNamespace()), "%s MUST carry the pod namespace", e.Type)
+			Expect(e.PodUID).To(Equal(podMeta.GetUid()), "%s MUST carry the pod UID", e.Type)
+			Expect(e.ContainerName).To(Equal(ctrName), "%s MUST carry the container name", e.Type)
+		}
+
+		// The rules below have no public specification: containerd/nri#286
+		// (unmerged draft, revision 2339aa3) covers only pod sandbox hooks.
+		// UpdateContainer lets plugins see and override a CRI resource
+		// update before it is applied, and PostUpdateContainer is how a
+		// plugin learns the values that were finally applied, as
+		// PostCreateContainer is for a create.
+
+		// A successful CRI UpdateContainerResources delivers UpdateContainer
+		// once with the requested resources, then PostUpdateContainer once
+		// with the applied resources.
+		It(
+			"should deliver UpdateContainer then PostUpdateContainer once each with the requested resources",
 			func(ctx SpecContext) {
 				By("updating the running container's resources via CRI")
 				Expect(
 					rc.UpdateContainerResources(ctx, containerID, updateRequestResources()),
 				).To(Succeed())
 
-				By("waiting for the PostUpdateContainer event")
-				Eventually(func() int {
-					return len(plugin.eventsFor(updateEventPostUpdate, containerID))
-				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
-					"exactly one PostUpdateContainer event is expected")
+				By("verifying each event is delivered exactly once")
+				expectOnePostUpdate(plugin, containerID)
+				Expect(plugin.eventsFor(updateEventUpdate, containerID)).To(HaveLen(1),
+					"UpdateContainer MUST be delivered exactly once")
 
 				By("verifying event order")
 				Expect(plugin.eventTypesFor(containerID)).To(Equal(
 					[]string{updateEventUpdate, updateEventPostUpdate}),
 					"UpdateContainer MUST be delivered before PostUpdateContainer")
 
-				By("verifying the UpdateContainer event carries the IDs and requested resources")
+				By(
+					"verifying the UpdateContainer event carries the identity and requested resources",
+				)
 
 				update := plugin.eventsFor(updateEventUpdate, containerID)[0]
-				Expect(update.PodSandboxID).To(Equal(podID))
+				expectIdentity(update)
 				Expect(update.Resources).NotTo(BeNil(),
 					"UpdateContainer MUST carry the requested Linux resources")
 				Expect(update.Resources.GetCpu().GetShares().GetValue()).To(
@@ -386,23 +510,32 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Equal(updateRequestMemoryLimit),
 					"UpdateContainer MUST carry the requested memory limit")
 
-				By("verifying the PostUpdateContainer event carries the IDs and updated resources")
+				By(
+					"verifying the PostUpdateContainer event carries the identity and applied resources",
+				)
 
 				post := plugin.eventsFor(updateEventPostUpdate, containerID)[0]
-				Expect(post.PodSandboxID).To(Equal(podID))
+				expectIdentity(post)
 				Expect(post.Resources).NotTo(BeNil(),
-					"PostUpdateContainer MUST carry the container's Linux resources")
-				Expect(post.Resources.GetCpu().GetShares().GetValue()).To(
-					BeEquivalentTo(updateRequestCPUShares),
-					"PostUpdateContainer MUST reflect the updated CPU shares")
+					"PostUpdateContainer MUST carry the container's applied Linux resources")
+				expectSameCPUShares(int64(post.Resources.GetCpu().GetShares().GetValue()),
+					updateRequestCPUShares, "PostUpdateContainer MUST carry the applied CPU shares")
 				Expect(post.Resources.GetMemory().GetLimit().GetValue()).To(
 					Equal(updateRequestMemoryLimit),
-					"PostUpdateContainer MUST reflect the updated memory limit")
-			})
+					"PostUpdateContainer MUST carry the applied memory limit")
+			},
+		)
 
+		// A resource override returned from UpdateContainer wins over the
+		// CRI request; fields the plugin does not set keep the requested
+		// values.
 		It(
 			"should apply resources adjusted by the plugin in UpdateContainer",
 			func(ctx SpecContext) {
+				// Whether the runtime reports resources at all is read before
+				// the update, independently of the outcome under test.
+				before := statusLinuxResources(ctx, rc, containerID)
+
 				plugin.setOnUpdate(
 					func(container *nri.Container, _ *nri.LinuxResources) ([]*nri.ContainerUpdate, error) {
 						u := &nri.ContainerUpdate{}
@@ -418,36 +551,39 @@ var _ = framework.KubeDescribe("NRI", func() {
 					rc.UpdateContainerResources(ctx, containerID, updateRequestResources()),
 				).To(Succeed())
 
-				Eventually(func() int {
-					return len(plugin.eventsFor(updateEventPostUpdate, containerID))
-				}, 10*time.Second, 50*time.Millisecond).Should(Equal(1),
-					"exactly one PostUpdateContainer event is expected")
+				expectOnePostUpdate(plugin, containerID)
 
 				By("verifying PostUpdateContainer reflects the plugin's adjustment")
 
 				post := plugin.eventsFor(updateEventPostUpdate, containerID)[0]
+				expectIdentity(post)
 				Expect(post.Resources.GetMemory().GetLimit().GetValue()).To(
 					Equal(updatePluginMemoryLimit),
 					"the plugin's memory limit MUST supersede the CRI-requested one")
-				Expect(post.Resources.GetCpu().GetShares().GetValue()).To(
-					BeEquivalentTo(updateRequestCPUShares),
-					"CRI-requested resources not touched by the plugin MUST be preserved")
+				expectSameCPUShares(int64(post.Resources.GetCpu().GetShares().GetValue()),
+					updateRequestCPUShares,
+					"CRI-requested CPU shares not touched by the plugin MUST be preserved")
 
 				By("verifying ContainerStatus reports the adjusted resources")
 
-				res := statusLinuxResources(ctx, rc, containerID)
-				if res == nil {
+				after := statusLinuxResources(ctx, rc, containerID)
+
+				if before == nil {
 					Skip("ContainerStatus does not report Resources; the runtime does not " +
 						"expose applied resources, so the plugin adjustment cannot be verified via CRI")
 				}
 
-				Expect(res.GetMemoryLimitInBytes()).To(Equal(updatePluginMemoryLimit),
+				Expect(after).NotTo(BeNil(),
+					"ContainerStatus reported Resources before the update and MUST still report them")
+				Expect(after.GetMemoryLimitInBytes()).To(Equal(updatePluginMemoryLimit),
 					"ContainerStatus MUST report the memory limit set by the NRI plugin")
-				Expect(res.GetCpuShares()).To(Equal(updateRequestCPUShares),
+				expectSameCPUShares(after.GetCpuShares(), updateRequestCPUShares,
 					"ContainerStatus MUST report the CRI-requested CPU shares")
 			},
 		)
 
+		// An error from UpdateContainer fails the CRI call: no
+		// PostUpdateContainer is delivered and the resources are not changed.
 		It("should fail UpdateContainerResources and keep resources when the plugin errors",
 			func(ctx SpecContext) {
 				before := statusLinuxResources(ctx, rc, containerID)
@@ -464,29 +600,82 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(err).To(HaveOccurred(),
 					"UpdateContainerResources MUST fail when the NRI UpdateContainer hook returns an error")
 
-				Expect(plugin.eventsFor(updateEventUpdate, containerID)).To(HaveLen(1),
-					"the NRI UpdateContainer hook should have fired before the failure")
-
-				By("verifying no PostUpdateContainer event is delivered for the failed update")
-				Consistently(func() int {
-					return len(plugin.eventsFor(updateEventPostUpdate, containerID))
-				}, 2*time.Second, 200*time.Millisecond).Should(BeZero(),
-					"PostUpdateContainer MUST NOT be delivered for a failed update")
-
-				By("verifying ContainerStatus reports the original resources")
-
+				// Read the resources right when the call returns: a failed
+				// update must leave them unchanged, not restore them later.
 				after := statusLinuxResources(ctx, rc, containerID)
-				if before == nil || after == nil {
+
+				By(
+					"verifying the failed call delivered UpdateContainer at most once and no PostUpdateContainer",
+				)
+				Expect(plugin.eventsFor(updateEventUpdate, containerID)).To(HaveLen(1),
+					"the NRI UpdateContainer hook MUST have been called before the failure")
+				Consistently(func() []string {
+					return plugin.eventTypesFor(containerID)
+				}, 2*time.Second, 200*time.Millisecond).Should(Equal([]string{updateEventUpdate}),
+					"a failed update MUST deliver UpdateContainer at most once and no PostUpdateContainer")
+
+				By(
+					"verifying ContainerStatus reported the original resources when the call returned",
+				)
+
+				if before != nil {
+					Expect(after).NotTo(BeNil(),
+						"ContainerStatus reported Resources before the update and MUST still report them")
+					expectSameCPUShares(after.GetCpuShares(), updateInitialCPUShares,
+						"CPU shares MUST be unchanged after a failed update")
+					Expect(after.GetMemoryLimitInBytes()).To(Equal(updateInitialMemoryLimit),
+						"memory limit MUST be unchanged after a failed update")
+					Expect(after.GetCpuShares()).To(Equal(before.GetCpuShares()),
+						"CPU shares MUST be unchanged after a failed update")
+					Expect(after.GetMemoryLimitInBytes()).To(Equal(before.GetMemoryLimitInBytes()),
+						"memory limit MUST be unchanged after a failed update")
+				}
+
+				By("verifying the plugin still observes a successful update (positive control)")
+				plugin.setOnUpdate(nil)
+				Expect(
+					rc.UpdateContainerResources(ctx, containerID, updateRequestResources()),
+				).To(Succeed())
+				expectOnePostUpdate(plugin, containerID)
+
+				if before == nil {
 					Skip("ContainerStatus does not report Resources; the runtime does not " +
 						"expose applied resources, so unchanged resources cannot be verified via CRI")
 				}
+			})
 
-				Expect(after.GetCpuShares()).To(Equal(updateInitialCPUShares),
-					"CPU shares MUST be unchanged after a failed update")
-				Expect(after.GetMemoryLimitInBytes()).To(Equal(updateInitialMemoryLimit),
-					"memory limit MUST be unchanged after a failed update")
-				Expect(after.GetCpuShares()).To(Equal(before.GetCpuShares()))
-				Expect(after.GetMemoryLimitInBytes()).To(Equal(before.GetMemoryLimitInBytes()))
+		// An error from PostUpdateContainer does not undo the update and does
+		// not fail the CRI call: the update has already been applied.
+		It("should keep the update and succeed when PostUpdateContainer errors",
+			func(ctx SpecContext) {
+				before := statusLinuxResources(ctx, rc, containerID)
+
+				plugin.setPostUpdateErr(errors.New("induced NRI PostUpdateContainer failure"))
+
+				By("updating the running container's resources via CRI")
+				Expect(
+					rc.UpdateContainerResources(ctx, containerID, updateRequestResources()),
+				).To(Succeed(),
+					"UpdateContainerResources MUST NOT fail when the NRI PostUpdateContainer hook returns an error")
+
+				expectOnePostUpdate(plugin, containerID)
+				expectIdentity(plugin.eventsFor(updateEventPostUpdate, containerID)[0])
+
+				By("verifying ContainerStatus reports the updated resources")
+
+				after := statusLinuxResources(ctx, rc, containerID)
+
+				if before == nil {
+					Skip("ContainerStatus does not report Resources; the runtime does not " +
+						"expose applied resources, so the kept update cannot be verified via CRI")
+				}
+
+				Expect(after).NotTo(BeNil(),
+					"ContainerStatus reported Resources before the update and MUST still report them")
+				expectSameCPUShares(after.GetCpuShares(), updateRequestCPUShares,
+					"CPU shares MUST stay updated after a PostUpdateContainer error")
+				Expect(after.GetMemoryLimitInBytes()).To(Equal(updateRequestMemoryLimit),
+					"memory limit MUST stay updated after a PostUpdateContainer error")
 			})
 	})
 })
