@@ -24,8 +24,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nri "github.com/containerd/nri/pkg/api"
@@ -44,7 +46,10 @@ const stopInfraCgroupRoot = "/sys/fs/cgroup"
 var _ = framework.KubeDescribe("NRI", func() {
 	f := framework.NewDefaultCRIFramework()
 
-	var rc internalapi.RuntimeService
+	var (
+		rc internalapi.RuntimeService
+		ic internalapi.ImageManagerService
+	)
 
 	BeforeEach(func() {
 		if framework.TestContext.NRISocketPath == "" {
@@ -52,6 +57,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 		}
 
 		rc = f.CRIClient.CRIRuntimeClient
+		ic = f.CRIClient.CRIImageClient
 	})
 
 	Context("StopPodSandbox infrastructure", Serial, func() {
@@ -104,6 +110,7 @@ var _ = framework.KubeDescribe("NRI", func() {
 					framework.Logf("AfterEach: StopPodSandbox(%s) failed: %v", podID, err)
 				}
 
+				// RemovePodSandbox also removes the workload containers.
 				if err := rc.RemovePodSandbox(ctx, podID); err != nil {
 					framework.Logf("AfterEach: RemovePodSandbox(%s) failed: %v", podID, err)
 				}
@@ -117,22 +124,28 @@ var _ = framework.KubeDescribe("NRI", func() {
 		})
 
 		It(
-			"should keep the pod network namespace, pod IP and pod cgroup on the host while the StopPodSandbox hook is blocked",
+			"should keep the pod network namespace, pod IPs and sandbox cgroup, with workload containers stopped, "+
+				"while the StopPodSandbox hook is blocked",
 			func(ctx SpecContext) {
-				// Spec (NRI pod sandbox lifecycle, StopPodSandbox "Sandbox State
-				// Contract" and ordering rule 7): while the StopPodSandbox hook
-				// runs, the network namespace and CNI networks are not reclaimed
-				// and the pod's cgroups remain accessible. This test inspects the
-				// host directly (namespace file, addresses inside the namespace,
-				// cgroup directory) while the hook is blocked.
+				// The NRI pod sandbox lifecycle draft (containerd/nri#286 at
+				// revision 2339aa3, an unmerged draft), StopPodSandbox "Sandbox
+				// State Contract" and its ordering rules: when the StopPodSandbox
+				// hook runs, every workload container has already been stopped,
+				// and the network namespace, the pod IPs inside it and the pod
+				// cgroup are not reclaimed until the hook returns. A plugin that
+				// releases per-pod resources in this hook needs them to still be
+				// there. The test blocks the hook for its own pod and inspects the
+				// host directly while it is blocked.
 				hookBlocking := make(chan struct{})
 				hookReached := make(chan *nri.PodSandbox, 1)
 
 				var (
 					hookOnce    sync.Once
 					releaseOnce sync.Once
-					runPodMu    sync.Mutex
+					hookMu      sync.Mutex
 					runPod      *nri.PodSandbox
+					blockPodID  string
+					hookExpired atomic.Bool
 				)
 
 				releaseHook = func() { releaseOnce.Do(func() { close(hookBlocking) }) }
@@ -143,17 +156,26 @@ var _ = framework.KubeDescribe("NRI", func() {
 				Expect(err).NotTo(HaveOccurred(), "failed to start NRI test stub")
 
 				testStub.Plugin.OnRunPodSandbox = func(_ context.Context, pod *nri.PodSandbox) error {
-					runPodMu.Lock()
-					defer runPodMu.Unlock()
+					hookMu.Lock()
+					defer hookMu.Unlock()
 
 					runPod = pod
 
 					return nil
 				}
 
-				// Block only the first StopPodSandbox invocation; later ones
-				// (e.g. AfterEach cleanup) pass straight through.
+				// Block only the first StopPodSandbox hook for the test's own
+				// pod. Hooks for other pods, and later invocations (e.g.
+				// AfterEach cleanup), pass straight through.
 				testStub.Plugin.OnStopPodSandbox = func(hookCtx context.Context, pod *nri.PodSandbox) error {
+					hookMu.Lock()
+					target := blockPodID
+					hookMu.Unlock()
+
+					if target == "" || pod.GetId() != target {
+						return nil
+					}
+
 					firstInvocation := false
 
 					hookOnce.Do(func() { firstInvocation = true })
@@ -167,6 +189,9 @@ var _ = framework.KubeDescribe("NRI", func() {
 					select {
 					case <-hookBlocking:
 					case <-hookCtx.Done():
+						// The runtime gave up on the hook: anything observed
+						// from now on is post-hook state.
+						hookExpired.Store(true)
 					}
 
 					return nil
@@ -188,23 +213,37 @@ var _ = framework.KubeDescribe("NRI", func() {
 					Labels: framework.DefaultPodLabels,
 				}
 
-				podCgroupDirs := stopInfraCgroupHostDirs(cgroupParent, systemdDriver)
 				if !systemdDriver {
 					// The cgroupfs parent is unique to this test; the runtime
-					// creates it on demand and nothing else removes it.
-					createdCgroupDirs = podCgroupDirs
+					// creates it on demand (in every cgroup v1 hierarchy) and
+					// nothing else removes it.
+					createdCgroupDirs = stopInfraCgroupHostDirs(cgroupParent, true)
 				}
 
 				podID = framework.RunPodSandbox(ctx, rc, podConfig)
 				Expect(podID).NotTo(BeEmpty())
 
-				By(
-					"recording the pod network namespace, pod IPs and pod cgroup before StopPodSandbox",
+				By("creating and starting a workload container in the sandbox")
+				framework.PullPublicImage(
+					ctx,
+					ic,
+					framework.TestContext.TestImageList.DefaultTestContainerImage,
+					nil,
 				)
 
-				runPodMu.Lock()
+				containerID := framework.CreateContainer(ctx, rc, ic,
+					stopInfraContainerConfig("nri-test-stop-infra-ctr-"+framework.NewUUID()),
+					podID, podConfig)
+				Expect(containerID).NotTo(BeEmpty())
+				Expect(rc.StartContainer(ctx, containerID)).To(Succeed())
+
+				By(
+					"recording the pod network namespace, pod IPs and sandbox cgroup before StopPodSandbox",
+				)
+
+				hookMu.Lock()
 				startedPod := runPod
-				runPodMu.Unlock()
+				hookMu.Unlock()
 				Expect(startedPod).NotTo(BeNil(), "RunPodSandbox NRI hook did not fire")
 				Expect(startedPod.GetId()).To(Equal(podID))
 
@@ -219,102 +258,150 @@ var _ = framework.KubeDescribe("NRI", func() {
 
 				podIPs := stopInfraPodIPs(statusResp.GetStatus())
 				if len(podIPs) == 0 {
-					framework.Logf(
-						"pod %s has no IP in PodSandboxStatus (no CNI network?); skipping the pod IP check",
-						podID,
-					)
-				} else {
-					Expect(stopInfraCheckIPsInNetns(netnsPath, podIPs)).To(Succeed(),
-						"pod IPs must be configured inside the pod network namespace before StopPodSandbox")
+					Skip(fmt.Sprintf("precondition missing: pod %s has no IP in PodSandboxStatus "+
+						"(no CNI network configured?), so the pod IP check cannot run", podID))
 				}
 
-				Expect(stopInfraCheckCgroupDirs(podCgroupDirs)).To(Succeed(),
-					"pod cgroup %q must exist before StopPodSandbox", cgroupParent)
+				Expect(stopInfraCheckIPsInNetns(netnsPath, podIPs)).To(Succeed(),
+					"pod IPs must be configured inside the pod network namespace before StopPodSandbox")
+
+				// The sandbox's own cgroup, not CgroupParent: teardown never
+				// removes the parent, so checking it would prove nothing.
+				sandboxCgroupsPath := startedPod.GetLinux().GetCgroupsPath()
+				if sandboxCgroupsPath == "" {
+					Skip("precondition missing: the RunPodSandbox NRI pod reports no sandbox " +
+						"cgroups path, so the sandbox cgroup cannot be located")
+				}
+
+				sandboxCgroupDirs := stopInfraCgroupHostDirs(
+					stopInfraCgroupRelPath(sandboxCgroupsPath, systemdDriver), false)
+				Expect(stopInfraCheckCgroupDirs(sandboxCgroupDirs)).To(Succeed(),
+					"sandbox cgroup %q must exist before StopPodSandbox", sandboxCgroupsPath)
 
 				By("triggering StopPodSandbox in a goroutine")
 
+				hookMu.Lock()
+				blockPodID = podID
+				hookMu.Unlock()
+
 				var stopErr error
 
+				stopReturned := make(chan struct{})
+
 				stopWg.Go(func() {
+					defer close(stopReturned)
+
 					stopErr = rc.StopPodSandbox(ctx, podID)
 				})
 
 				By("waiting for the StopPodSandbox hook to be reached")
 
-				var stoppingPod *nri.PodSandbox
-
 				select {
-				case stoppingPod = <-hookReached:
+				case <-hookReached:
 				case <-time.After(30 * time.Second):
 					Fail("timed out waiting for the StopPodSandbox NRI hook to fire")
 				}
 
-				// Spec violations are collected while the hook is blocked and
-				// reported (as a Skip) only after the hook is released.
-				var discrepancies []string
+				By("inspecting the sandbox while the hook is blocked")
 
-				By(
-					"verifying the pod network namespace still exists and is valid while the hook is blocked",
-				)
+				// Every check below must finish before the runtime's plugin
+				// request timeout ends the hook, so the results are collected
+				// first and asserted only after the hook context is known not to
+				// have expired.
+				netnsErr := stopInfraCheckNetns(netnsPath)
 
-				hookNetnsPath := stopInfraNetnsPath(stoppingPod)
-				if hookNetnsPath == "" {
-					discrepancies = append(discrepancies, fmt.Sprintf(
-						"the StopPodSandbox NRI pod reports no network namespace path "+
-							"(RunPodSandbox reported %q); the runtime may have removed the namespace "+
-							"before invoking the hook",
-						netnsPath))
-					hookNetnsPath = netnsPath
-				} else if hookNetnsPath != netnsPath {
-					discrepancies = append(discrepancies, fmt.Sprintf(
-						"the StopPodSandbox NRI pod reports network namespace %q, "+
-							"but RunPodSandbox reported %q",
-						hookNetnsPath, netnsPath))
+				var ipErr error
+				if netnsErr == nil {
+					ipErr = stopInfraCheckIPsInNetns(netnsPath, podIPs)
 				}
 
-				netnsErr := stopInfraCheckNetns(hookNetnsPath)
-				if netnsErr != nil {
-					discrepancies = append(discrepancies, fmt.Sprintf(
-						"pod network namespace is not usable during the StopPodSandbox hook: %v",
-						netnsErr,
-					))
+				cgroupErr := stopInfraCheckCgroupDirs(sandboxCgroupDirs)
+
+				containers, listErr := rc.ListContainers(ctx, &runtimeapi.ContainerFilter{
+					PodSandboxId: podID,
+				})
+
+				hookStatus, hookStatusErr := rc.PodSandboxStatus(ctx, podID, false)
+				events := FilterEventsByPodID(testStub.Plugin.Events(), podID)
+
+				stopReturnedWhileBlocked := false
+
+				select {
+				case <-stopReturned:
+					stopReturnedWhileBlocked = true
+				default:
 				}
 
-				if len(podIPs) > 0 && netnsErr == nil {
-					By(
-						"verifying the pod IPs are still configured inside the network namespace while the hook is blocked",
-					)
+				expired := hookExpired.Load()
 
-					if ipErr := stopInfraCheckIPsInNetns(hookNetnsPath, podIPs); ipErr != nil {
-						discrepancies = append(discrepancies, fmt.Sprintf(
-							"pod IPs are not configured inside the network namespace during the "+
-								"StopPodSandbox hook (CNI teardown happened before the hook?): %v", ipErr))
+				releaseHook()
+
+				Expect(expired).To(BeFalse(), "invalid test run: the StopPodSandbox hook context "+
+					"expired before the checks completed, so they may have observed post-hook state; "+
+					"raise the runtime's NRI plugin request timeout")
+				Expect(stopReturnedWhileBlocked).To(BeFalse(),
+					"StopPodSandbox must not return while a plugin's StopPodSandbox hook is in progress")
+
+				Expect(netnsErr).NotTo(HaveOccurred(),
+					"pod network namespace must still be a live namespace during the StopPodSandbox hook")
+				Expect(ipErr).NotTo(HaveOccurred(),
+					"pod IPs must still be configured inside the pod network namespace during the StopPodSandbox hook")
+				Expect(cgroupErr).NotTo(HaveOccurred(),
+					"sandbox cgroup %q must still exist during the StopPodSandbox hook", sandboxCgroupsPath)
+
+				Expect(
+					listErr,
+				).NotTo(HaveOccurred(), "ListContainers during the StopPodSandbox hook")
+
+				var workload *runtimeapi.Container
+
+				for _, c := range containers {
+					if c.GetId() == containerID {
+						workload = c
 					}
 				}
 
-				By("verifying the pod cgroup still exists while the hook is blocked")
+				Expect(workload).NotTo(BeNil(),
+					"workload container %s must still be listed during the StopPodSandbox hook", containerID)
+				Expect(workload.GetState()).To(Equal(runtimeapi.ContainerState_CONTAINER_EXITED),
+					"workload container %s must be EXITED before the StopPodSandbox hook runs", containerID)
 
-				if hookParent := stoppingPod.GetLinux().
-					GetCgroupParent(); hookParent != cgroupParent {
-					framework.Logf("StopPodSandbox NRI pod reports cgroup parent %q, configured %q",
-						hookParent, cgroupParent)
+				stopCtrIdx, stopPodIdx := -1, -1
+
+				for i, e := range events {
+					switch {
+					case e.Type == EventStopContainer && e.ContainerID == containerID && stopCtrIdx < 0:
+						stopCtrIdx = i
+					case e.Type == EventStopPodSandbox && stopPodIdx < 0:
+						stopPodIdx = i
+					}
 				}
 
-				if cgErr := stopInfraCheckCgroupDirs(podCgroupDirs); cgErr != nil {
-					discrepancies = append(discrepancies, fmt.Sprintf(
-						"pod cgroup %q is not accessible during the StopPodSandbox hook: %v",
-						cgroupParent, cgErr))
-				}
+				Expect(stopCtrIdx).To(BeNumerically(">=", 0),
+					"StopContainer hook for workload container %s must be delivered before StopPodSandbox "+
+						"(events: %+v)", containerID, events)
+				Expect(stopCtrIdx).To(BeNumerically("<", stopPodIdx),
+					"StopContainer hook for workload container %s must precede the StopPodSandbox hook "+
+						"(events: %+v)", containerID, events)
 
-				By("releasing the hook and verifying StopPodSandbox succeeds")
-				releaseHook()
+				// CRI API: PodSandboxState is SANDBOX_READY only while the
+				// sandbox is running; it is being stopped here.
+				Expect(
+					hookStatusErr,
+				).NotTo(HaveOccurred(), "PodSandboxStatus during the StopPodSandbox hook")
+				Expect(
+					hookStatus.GetStatus().GetState(),
+				).To(Equal(runtimeapi.PodSandboxState_SANDBOX_NOTREADY),
+					"sandbox must not be Ready during the StopPodSandbox hook")
+
+				By("waiting for StopPodSandbox to return")
 				stopWg.Wait()
 				Expect(
 					stopErr,
 				).NotTo(HaveOccurred(), "StopPodSandbox should succeed after hook returns")
 
-				// The NRI spec does not require the namespace to be gone once
-				// StopPodSandbox returns, so only record what was observed.
+				// Whether the namespace is gone once StopPodSandbox returns is
+				// not part of the hook contract, so only record what was observed.
 				if _, statErr := os.Stat(netnsPath); statErr == nil {
 					framework.Logf(
 						"pod network namespace %s still exists after StopPodSandbox returned",
@@ -328,20 +415,50 @@ var _ = framework.KubeDescribe("NRI", func() {
 					)
 				}
 
+				By("verifying CreateContainer in the stopped sandbox fails and delivers no hook")
+
+				// A stopped sandbox is never reused: its infrastructure is being
+				// reclaimed, and a container created in it would deliver hooks
+				// for a pod that plugins were already told is stopped
+				// (containerd/containerd#13599).
+				lateName := "nri-test-stop-infra-late-" + framework.NewUUID()
+				_, createErr := framework.CreateContainerWithError(ctx, rc, ic,
+					stopInfraContainerConfig(lateName), podID, podConfig)
+				Expect(createErr).To(HaveOccurred(),
+					"CreateContainer in a stopped sandbox must fail")
+
+				// Positive control: RemovePodSandbox must deliver its hook to
+				// the same stub, proving it could have seen a CreateContainer.
 				Expect(rc.RemovePodSandbox(ctx, podID)).NotTo(HaveOccurred(),
 					"RemovePodSandbox should succeed after stop")
+
+				removedPodID := podID
 				podID = ""
 
-				if len(discrepancies) > 0 {
-					Skip("spec discrepancy: the NRI pod sandbox lifecycle spec requires the pod " +
-						"network namespace, CNI networks and pod cgroups to remain in place until the " +
-						"StopPodSandbox hook completes, but the runtime did not keep them:\n- " +
-						strings.Join(discrepancies, "\n- "))
-				}
+				events = FilterEventsByPodID(testStub.Plugin.Events(), removedPodID)
+				Expect(events).To(ContainElement(HaveField("Type", EventRemovePodSandbox)),
+					"RemovePodSandbox hook must reach the stub (positive control)")
+				Expect(events).NotTo(ContainElement(SatisfyAll(
+					HaveField("Type", EventCreateContainer),
+					HaveField("ContainerName", lateName),
+				)), "a rejected CreateContainer in a stopped sandbox must not deliver a CreateContainer hook")
 			},
 		)
 	})
 })
+
+// stopInfraContainerConfig returns a long-running workload container config.
+func stopInfraContainerConfig(name string) *runtimeapi.ContainerConfig {
+	return &runtimeapi.ContainerConfig{
+		Metadata: framework.BuildContainerMetadata(name, framework.DefaultAttempt),
+		Image: &runtimeapi.ImageSpec{
+			Image:              framework.TestContext.TestImageList.DefaultTestContainerImage,
+			UserSpecifiedImage: framework.TestContext.TestImageList.DefaultTestContainerImage,
+		},
+		Command: framework.DefaultPauseCommand,
+		Linux:   &runtimeapi.LinuxContainerConfig{},
+	}
+}
 
 // stopInfraCgroupParent returns a pod-level cgroup parent for the test pod and
 // whether the runtime uses the systemd cgroup driver. With cgroupfs a
@@ -358,23 +475,50 @@ func stopInfraCgroupParent(
 	return "/nri-test-stop-infra-" + framework.NewUUID(), false
 }
 
-// stopInfraCgroupHostDirs maps a CRI cgroup parent to the cgroup directories
-// on the host: one directory on cgroup v2, one per controller on cgroup v1.
-func stopInfraCgroupHostDirs(parent string, systemd bool) []string {
-	rel := parent
-	if systemd {
-		rel = stopInfraExpandSystemdSlice(filepath.Base(parent))
+// stopInfraCgroupRelPath maps a runtime cgroups path to a path relative to the
+// cgroup root. With systemd it has the form "slice:prefix:name", which is the
+// scope "prefix-name.scope" inside the expanded slice.
+func stopInfraCgroupRelPath(cgroupsPath string, systemd bool) string {
+	if parts := strings.Split(cgroupsPath, ":"); systemd && len(parts) == 3 {
+		return filepath.Join(
+			stopInfraExpandSystemdSlice(parts[0]),
+			parts[1]+"-"+parts[2]+".scope",
+		)
 	}
 
+	return cgroupsPath
+}
+
+// stopInfraCgroupHostDirs maps a cgroup path relative to the cgroup root to the
+// directories on the host: one on cgroup v2; on cgroup v1, one per hierarchy
+// (all of them when all is set, else only those with the cpu, memory or pids
+// controller, where every runtime places the pod).
+func stopInfraCgroupHostDirs(rel string, all bool) []string {
 	if _, err := os.Stat(filepath.Join(stopInfraCgroupRoot, "cgroup.controllers")); err == nil {
 		return []string{filepath.Join(stopInfraCgroupRoot, rel)}
 	}
 
+	entries, err := os.ReadDir(stopInfraCgroupRoot)
+	if err != nil {
+		return nil
+	}
+
 	var dirs []string
 
-	for _, controller := range []string{"cpu", "memory", "pids"} {
-		hierarchy := filepath.Join(stopInfraCgroupRoot, controller)
-		if _, err := os.Stat(hierarchy); err == nil {
+	for _, entry := range entries {
+		// Skip symlinks such as "cpu" -> "cpu,cpuacct": the target is listed too.
+		if !entry.IsDir() {
+			continue
+		}
+
+		hierarchy := filepath.Join(stopInfraCgroupRoot, entry.Name())
+		if _, err := os.Stat(filepath.Join(hierarchy, "cgroup.procs")); err != nil {
+			continue
+		}
+
+		if all || slices.ContainsFunc(strings.Split(entry.Name(), ","), func(c string) bool {
+			return c == "cpu" || c == "memory" || c == "pids"
+		}) {
 			dirs = append(dirs, filepath.Join(hierarchy, rel))
 		}
 	}
